@@ -10,6 +10,8 @@ OVPN_CONFIG_DIR="/etc/openvpn/configs"
 PRIVOXY_CONFIG="/app/config"
 OPENVPN_LOG="/tmp/openvpn_connect.log"
 ROTATION_INTERVAL_SECONDS=${ROTATION_INTERVAL:-300}
+VPN_CONNECT_TIMEOUT=${VPN_CONNECT_TIMEOUT:-45}
+OVPN_FILE_PATTERN=${OVPN_FILE_PATTERN:-*.ovpn}
 
 # --- GLOBAL VARIABLES for file list ---
 # OVPN_FILE_LIST will hold newline-separated, shuffled file paths
@@ -36,9 +38,9 @@ load_and_shuffle_ovpn_files() {
   IFS=$'\n'
   echo "DEBUG (func): IFS set to newline."
 
-  echo "DEBUG (func): Finding files in $OVPN_CONFIG_DIR..."
+  echo "DEBUG (func): Finding files in $OVPN_CONFIG_DIR (pattern: $OVPN_FILE_PATTERN)..."
   # OVPN_FILE_LIST is a global variable
-  OVPN_FILE_LIST=$(find "$OVPN_CONFIG_DIR" -maxdepth 1 -type f -name "*.ovpn" -print 2>/tmp/find_stderr.txt | shuf)
+  OVPN_FILE_LIST=$(find "$OVPN_CONFIG_DIR" -maxdepth 1 -type f -name "$OVPN_FILE_PATTERN" -print 2>/tmp/find_stderr.txt | shuf)
   _find_stderr=$(cat /tmp/find_stderr.txt)
   if [ -n "$_find_stderr" ]; then
     echo "DEBUG (func): find stderr: [$_find_stderr]"
@@ -61,6 +63,18 @@ load_and_shuffle_ovpn_files() {
   echo "Found $_num_files OVPN configuration files in OVPN_FILE_LIST. Ready to cycle."
   echo "DEBUG (func): Returning 0 (success)."
   return 0
+}
+
+# --- FUNCTION to detect VPN interface name from log or system ---
+detect_vpn_interface() {
+  _iface=""
+  if [ -f "$OPENVPN_LOG" ]; then
+    _iface=$(sed -n 's/.*TUN\/TAP device \([^ ]*\).*/\1/p' "$OPENVPN_LOG" | head -n 1)
+  fi
+  if [ -z "$_iface" ]; then
+    _iface=$(ip link show 2>/dev/null | awk -F': ' '/tun[0-9]+/ {sub(":", "", $2); print $2; exit}')
+  fi
+  echo "$_iface"
 }
 
 # --- FUNCTION to get the next file from OVPN_FILE_LIST ---
@@ -192,11 +206,17 @@ while true; do
     --daemon
 
   VPN_INTERFACE="tun0"
-  TIMEOUT=45
+  TIMEOUT="$VPN_CONNECT_TIMEOUT"
   echo "Waiting up to $TIMEOUT seconds for VPN interface $VPN_INTERFACE to appear and get an IP..."
   counter=0
   vpn_ip_assigned=0
   while [ $counter -lt $TIMEOUT ]; do
+    detected_iface=$(detect_vpn_interface)
+    if [ -n "$detected_iface" ] && [ "$detected_iface" != "$VPN_INTERFACE" ]; then
+      VPN_INTERFACE="$detected_iface"
+      echo ""
+      echo "Detected VPN interface from logs/system: $VPN_INTERFACE"
+    fi
     if ip link show "$VPN_INTERFACE" > /dev/null 2>&1 && ip addr show "$VPN_INTERFACE" | grep -q "inet "; then
       echo ""
       echo "VPN interface $VPN_INTERFACE is UP and has an IP address."

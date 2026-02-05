@@ -14,6 +14,7 @@ ENV PVPN_USERNAME="" \
 # Install packages
 RUN apk --no-cache add \
         coreutils \
+        iproute2 \
         openvpn \
         openresolv \
         privoxy \

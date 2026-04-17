@@ -1,10 +1,21 @@
 #!/bin/sh
-# Handles one HTTP connection on stdin/stdout (invoked by socat).
+# Handles one HTTP connection on stdin/stdout (invoked by socat via EXEC).
 # GET /health  — liveness (always 200 while this process can run)
 # GET /ready   — readiness (200 when OpenVPN tun0 has IPv4 and Privoxy is running)
 
-IFS= read -r req_line || exit 0
+http_400() {
+  printf 'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request'
+}
+
+IFS= read -r req_line || {
+  http_400
+  exit 0
+}
 path=$(printf '%s' "$req_line" | awk '{print $2}' | tr -d '\r')
+if [ -z "$path" ]; then
+  http_400
+  exit 0
+fi
 
 while IFS= read -r hdr; do
   hdr=$(printf '%s' "$hdr" | tr -d '\r')

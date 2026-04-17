@@ -115,9 +115,26 @@ get_next_ovpn_file() {
 # --- GLOBAL VARIABLE FOR PRIVPROXY PID ---
 privoxy_pid=""
 
+# --- HEALTH HTTP (socat) PID ---
+health_socat_pid=""
+
 # --- FUNCTION TO CLEANUP PROCESSES ---
 cleanup() {
   echo "Caught signal or exiting, cleaning up..."
+  if [ -n "$health_socat_pid" ] && kill -0 "$health_socat_pid" 2>/dev/null; then
+    echo "Stopping health HTTP listener (PID: $health_socat_pid)..."
+    kill "$health_socat_pid" 2>/dev/null || true
+    _wait_count=0
+    while kill -0 "$health_socat_pid" 2>/dev/null && [ $_wait_count -lt 5 ]; do
+      sleep 0.5
+      _wait_count=$((_wait_count + 1))
+    done
+    if kill -0 "$health_socat_pid" 2>/dev/null; then
+      kill -9 "$health_socat_pid" 2>/dev/null || true
+    fi
+  fi
+  health_socat_pid=""
+
   if [ -n "$privoxy_pid" ] && kill -0 "$privoxy_pid" 2>/dev/null; then
     echo "Stopping Privoxy (PID: $privoxy_pid)..."
     kill "$privoxy_pid"
@@ -150,6 +167,15 @@ cleanup() {
 }
 
 trap cleanup INT TERM EXIT
+
+# --- HEALTH / READY HTTP (separate from Privoxy proxy port) ---
+if [ "${HEALTH_HTTP_ENABLED:-1}" != "0" ]; then
+  HEALTH_PORT="${HEALTH_PORT:-8081}"
+  HEALTH_LISTEN_ADDR="${HEALTH_LISTEN_ADDR:-0.0.0.0}"
+  echo "Starting health HTTP listener on ${HEALTH_LISTEN_ADDR}:${HEALTH_PORT} (GET /health, GET /ready)..."
+  /app/health_httpd.sh &
+  health_socat_pid=$!
+fi
 
 # --- INITIAL LOAD OF OVPN FILES ---
 echo "DEBUG (main): Before initial call to load_and_shuffle_ovpn_files."

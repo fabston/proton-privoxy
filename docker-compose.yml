@@ -5,8 +5,9 @@ services:
     build: .
     container_name: proton_privoxy_service
     ports:
-      - "0.0.0.0:8100:8100" # Expose Privoxy port only to localhost on the host by default for security
-                              # Change to "8080:8080" if you need to access it from other machines on your LAN
+      - "0.0.0.0:8100:8100" # Privoxy HTTP proxy
+      - "0.0.0.0:8081:8081" # Liveness/readiness: GET /health, GET /ready (see HEALTH_PORT)
+                              # Change bind or ports if needed for your network
     cap_add:
       - NET_ADMIN             # Required for OpenVPN to modify network interfaces and routes
     # devices:                # Usually not needed if mknod in app/run works for /dev/net/tun

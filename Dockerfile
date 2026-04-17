@@ -2,14 +2,17 @@ FROM alpine:latest
 
 LABEL maintainer="Proton-Privoxy User"
 
-EXPOSE 8100
+EXPOSE 8100 8081
 
 # Default environment variables.
 ENV PVPN_USERNAME="" \
     PVPN_PASSWORD="" \
     HOST_NETWORK= \
     DNS_SERVERS_OVERRIDE= \
-    ROTATION_INTERVAL="300"
+    ROTATION_INTERVAL="300" \
+    HEALTH_PORT="8081" \
+    HEALTH_LISTEN_ADDR="0.0.0.0" \
+    HEALTH_HTTP_ENABLED="1"
 
 # Install packages
 RUN apk --no-cache add \
@@ -19,6 +22,7 @@ RUN apk --no-cache add \
         openresolv \
         privoxy \
         procps \
+        socat \
         wget \
         bash \
         findutils `# Usually part of base, but good to be explicit for 'find'` \
@@ -47,7 +51,9 @@ COPY match-all.action /etc/privoxy/match-all.action
 
 # Make the scripts executable
 RUN chmod +x /app/run \
-    && chmod +x /app/rotate_vpn.sh
+    && chmod +x /app/rotate_vpn.sh \
+    && chmod +x /app/health_httpd.sh \
+    && chmod +x /app/health_handler.sh
 
 # Default command to run when the container starts
 CMD ["/app/run"]

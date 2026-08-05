@@ -736,10 +736,18 @@ while true; do
       pkill -KILL openvpn
     fi
   fi
-  # Reap the daemonised OpenVPN that PID 1 inherited, so `pgrep -x openvpn`
-  # on the next cycle cannot match a zombie. See also `init: true` in
-  # docker-compose.yml, which handles this properly.
-  wait 2>/dev/null || true
+  # NOTE: there used to be a bare `wait` here to reap the daemonised OpenVPN.
+  # It was both wrong and dangerous. Wrong, because OpenVPN is an orphan
+  # adopted by PID 1 — tini, via `init: true` — which reaps it for us
+  # (verified: zombie count 0). Dangerous, because a bare `wait` waits for ALL
+  # background children, including the socat health listener, which is a
+  # `fork` server that never exits. On shutdown the loop could then never
+  # reach the break below, and the container hung until Docker SIGKILLed it.
+  #
+  # Second guard against exactly that class of hang: leave immediately once
+  # shutdown is requested, rather than looping round to select a new endpoint.
+  [ "$_shutdown" = "1" ] && break
+  logd "main loop: cycle complete"
   # No 'shift' needed as we are managing OVPN_FILE_LIST and CURRENT_OVPN_FILE
 done
 

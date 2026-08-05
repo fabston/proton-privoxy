@@ -88,6 +88,15 @@ passive_rtt() {
 # `head -c 1` returns as soon as one byte lands and closes the pipe, which
 # tears socat down — that is what makes this first-byte and not total time.
 #
+# BOTH socat timeouts are required, and they are different things:
+#   -T  inactivity timeout on the transfer
+#   -t  how long socat waits after ONE side reaches EOF before terminating
+# `-t` defaults to 0.5s. Our stdin is a `printf` that EOFs the instant the
+# request is written, so with the default socat tore the connection down half
+# a second later — before any real origin could answer over a VPN. Every probe
+# therefore recorded a failure, which showed up as a healthy endpoint slowly
+# accumulating an error rate with no successful latency sample to go with it.
+#
 # Plain HTTP by design: a CONNECT+TLS probe would fold handshake variance and
 # origin TLS config into a number meant to grade the exit path.
 # ---------------------------------------------------------------------------
@@ -104,7 +113,7 @@ probe_ttfb() {
   _pt_n=$(
     printf 'GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n' \
       "$_pt_url" "$_pt_host" "$PROBE_UA" \
-    | socat -T "$PROBE_TIMEOUT" - \
+    | socat -T "$PROBE_TIMEOUT" -t "$PROBE_TIMEOUT" - \
         "TCP:${PROBE_PROXY_HOST}:${PROBE_PROXY_PORT},connect-timeout=${PROBE_TIMEOUT}" 2>/dev/null \
     | head -c 1 | wc -c | tr -d ' '
   )

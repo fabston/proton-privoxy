@@ -79,53 +79,43 @@ passive_rtt() {
 # probe_ttfb <absolute-http-url>
 #
 # Timestamps measured:
-#   t0 - immediately before connect() to the local Privoxy listener
-#   t1 - immediately after the FIRST response byte is readable
-# TTFB = t1 - t0. It therefore includes Privoxy's own accept+parse and the
-# loopback hop; both are sub-millisecond and, more importantly, CONSTANT
-# across endpoints, so they cancel in the relative comparison we actually use.
+#   t0 - immediately before the request is issued
+#   t1 - immediately after the response completes
 #
-# `head -c 1` returns as soon as one byte lands and closes the pipe, which
-# tears socat down — that is what makes this first-byte and not total time.
+# This is total request time, NOT strictly time-to-first-byte. That is a
+# deliberate retreat. The original implementation drove socat by hand to catch
+# the first response byte, and it failed 100% of the time in this container for
+# reasons two rounds of fixes did not settle — every probe returned a failure
+# sample, which quietly inflated the error EWMA of perfectly healthy endpoints.
+# wget is the tool that demonstrably works here: it is what produces the
+# event=exit_ip line on every cycle.
 #
-# BOTH socat timeouts are required, and they are different things:
-#   -T  inactivity timeout on the transfer
-#   -t  how long socat waits after ONE side reaches EOF before terminating
-# `-t` defaults to 0.5s. Our stdin is a `printf` that EOFs the instant the
-# request is written, so with the default socat tore the connection down half
-# a second later — before any real origin could answer over a VPN. Every probe
-# therefore recorded a failure, which showed up as a healthy endpoint slowly
-# accumulating an error rate with no successful latency sample to go with it.
+# The accuracy cost is near zero for the intended targets. TTFB was chosen over
+# total time to stop payload size and origin bandwidth from dominating the
+# signal; with a ~15-byte response body those terms are microseconds. Keep
+# PROBE_TARGETS small and plain-HTTP and the two measures are equivalent.
 #
 # Plain HTTP by design: a CONNECT+TLS probe would fold handshake variance and
 # origin TLS config into a number meant to grade the exit path.
 # ---------------------------------------------------------------------------
 probe_ttfb() {
   _pt_url="$1"
-  _pt_rest="${_pt_url#http://}"
-  case "$_pt_rest" in
-    */*) _pt_host="${_pt_rest%%/*}" ;;
-    *)   _pt_host="$_pt_rest" ;;
-  esac
 
-  _pt_t0=$(date +%s%N 2>/dev/null) || { echo "0 1"; return 0; }
+  probe_clock_ok || { echo "0 1"; return 0; }
+  _pt_t0=$(date +%s%N 2>/dev/null)
 
-  _pt_n=$(
-    printf 'GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n' \
-      "$_pt_url" "$_pt_host" "$PROBE_UA" \
-    | socat -T "$PROBE_TIMEOUT" -t "$PROBE_TIMEOUT" - \
-        "TCP:${PROBE_PROXY_HOST}:${PROBE_PROXY_PORT},connect-timeout=${PROBE_TIMEOUT}" 2>/dev/null \
-    | head -c 1 | wc -c | tr -d ' '
-  )
-
-  _pt_t1=$(date +%s%N 2>/dev/null)
-
-  if [ "${_pt_n:-0}" -lt 1 ]; then
-    echo "0 1"          # no first byte within the timeout => failure sample
-    return 0
+  # -t 1: one attempt. Without it a failure costs tries x timeout and the
+  #       sample is charged the whole thing.
+  # -O /dev/null: we time the request, we do not want the body.
+  if http_proxy="http://${PROBE_PROXY_HOST}:${PROBE_PROXY_PORT}" \
+     wget -q -t 1 -T "$PROBE_TIMEOUT" -O /dev/null \
+          --user-agent="$PROBE_UA" "$_pt_url" 2>/dev/null
+  then
+    _pt_t1=$(date +%s%N 2>/dev/null)
+    awk -v a="$_pt_t0" -v b="$_pt_t1" 'BEGIN { printf "%.3f 0\n", (b - a) / 1000000 }'
+  else
+    echo "0 1"
   fi
-
-  awk -v a="$_pt_t0" -v b="$_pt_t1" 'BEGIN { printf "%.3f 0\n", (b - a) / 1000000 }'
 }
 
 # --- CLI dispatch, skipped when sourced as a library by rotate_vpn.sh ---

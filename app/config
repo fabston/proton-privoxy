@@ -53,10 +53,11 @@ permit-access 192.168.0.0/16
 # an error rather than a hang that outlives the endpoint serving it.
 socket-timeout 60
 
-# connect-timeout: cap on the upstream TCP connect. Without it a connect
-# attempt into a dead tunnel is bounded only by the kernel's SYN retry
-# schedule (~130s), which is longer than a whole rotation cycle.
-connect-timeout 15
+# NOTE: there is no `connect-timeout` directive in Privoxy — 3.0.34 rejects it
+# with "Ignoring unrecognized directive". Upstream connect attempts are bounded
+# by socket-timeout above and, failing that, by the kernel SYN retry schedule
+# (~130s). If that matters for your traffic the lever is the kernel's
+# net.ipv4.tcp_syn_retries, not Privoxy.
 
 # keep-alive-timeout: enables client-side keep-alive and bounds how long an
 # idle client connection is held. Leaving this unset means a new TCP

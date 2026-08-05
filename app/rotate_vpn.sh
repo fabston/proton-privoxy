@@ -73,35 +73,35 @@ fi
 
 # --- FUNCTION TO LOAD AND SHUFFLE OVPN FILES into OVPN_FILE_LIST ---
 load_and_shuffle_ovpn_files() {
-  echo "DEBUG (func): Entered load_and_shuffle_ovpn_files."
+  logd "Entered load_and_shuffle_ovpn_files."
   _old_ifs="$IFS"
   IFS=$'\n'
-  echo "DEBUG (func): IFS set to newline."
+  logd "IFS set to newline."
 
-  echo "DEBUG (func): Finding files in $OVPN_CONFIG_DIR (pattern: $OVPN_FILE_PATTERN)..."
+  logd "Finding files in $OVPN_CONFIG_DIR (pattern: $OVPN_FILE_PATTERN)..."
   # OVPN_FILE_LIST is a global variable
   OVPN_FILE_LIST=$(find "$OVPN_CONFIG_DIR" -maxdepth 1 -type f -name "$OVPN_FILE_PATTERN" -print 2>/tmp/find_stderr.txt | shuf)
   _find_stderr=$(cat /tmp/find_stderr.txt)
   if [ -n "$_find_stderr" ]; then
-    echo "DEBUG (func): find stderr: [$_find_stderr]"
+    logd "find stderr: [$_find_stderr]"
   fi
 
-  echo "DEBUG (func): OVPN_FILE_LIST is now: --START--\n$OVPN_FILE_LIST\n--END--"
+  logd "OVPN_FILE_LIST is now: --START--\n$OVPN_FILE_LIST\n--END--"
   _list_len=$(echo -n "$OVPN_FILE_LIST" | wc -c)
-  echo "DEBUG (func): OVPN_FILE_LIST character count (wc -c): $_list_len"
+  logd "OVPN_FILE_LIST character count (wc -c): $_list_len"
 
   IFS="$_old_ifs"
-  echo "DEBUG (func): Restored IFS to [$_old_ifs]."
+  logd "Restored IFS to [$_old_ifs]."
 
   if [ -z "$OVPN_FILE_LIST" ]; then
     echo "No .ovpn configuration files found in $OVPN_CONFIG_DIR"
-    echo "DEBUG (func): OVPN_FILE_LIST is empty. Returning 1 (failure)."
+    logd "OVPN_FILE_LIST is empty. Returning 1 (failure)."
     return 1
   fi
 
   _num_files=$(echo "$OVPN_FILE_LIST" | wc -l | awk '{$1=$1};1') # Count lines, trim whitespace
   echo "Found $_num_files OVPN configuration files in OVPN_FILE_LIST. Ready to cycle."
-  echo "DEBUG (func): Returning 0 (success)."
+  logd "Returning 0 (success)."
   return 0
 }
 
@@ -298,12 +298,33 @@ openvpn_running() {
   done | grep -q live
 }
 
+# egress_interface <ip> — which interface would a packet to <ip> actually leave by
+#
+# MUST be `ip route get`, not `ip route show default`. OpenVPN is started with
+# `--redirect-gateway def1`, which deliberately does NOT replace the default
+# route: it installs 0.0.0.0/1 and 128.0.0.0/1, which beat the default by
+# longest-prefix match. `ip route show default` therefore reports eth0 for the
+# entire life of a perfectly healthy tunnel. Checking it made the kill switch
+# fire on every tick and put the supervisor into a rotation storm.
+#
+# `ip route get` performs a real FIB lookup, so it is correct for def1, for a
+# full default replacement, and for policy routing alike.
+egress_interface() {
+  ip route get "$1" 2>/dev/null \
+    | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
 vpn_tunnel_alive() {
   openvpn_running || { logd "tunnel_check=fail reason=no_openvpn"; return 1; }
-  ip route show default 2>/dev/null | grep -q "dev $VPN_INTERFACE" \
-    || { logd "tunnel_check=fail reason=default_route_not_on_$VPN_INTERFACE"; return 1; }
-  ip link show "$VPN_INTERFACE" 2>/dev/null | grep -q "state UNKNOWN\|state UP\|UP," \
-    || { logd "tunnel_check=fail reason=iface_down"; return 1; }
+  _vta_dev=$(egress_interface "${VPN_ROUTE_PROBE_IP:-1.1.1.1}")
+  if [ -z "$_vta_dev" ]; then
+    logd "tunnel_check=fail reason=no_route_to_internet"
+    return 1
+  fi
+  if [ "$_vta_dev" != "$VPN_INTERFACE" ]; then
+    logd "tunnel_check=fail reason=egress_via_$_vta_dev_not_$VPN_INTERFACE"
+    return 1
+  fi
   return 0
 }
 

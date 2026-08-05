@@ -1,22 +1,28 @@
-# Canary overlay — run the new image ALONGSIDE prod before swapping it in.
+# Canary — run the new image ALONGSIDE prod before swapping it in.
 #
-#   docker compose -p privoxy-canary \
-#     -f docker-compose.yml -f docker-compose.canary.yml up -d --build
+# STANDALONE, not an overlay. Compose CONCATENATES `ports:` across multiple
+# -f files rather than replacing them, so an overlay inherits prod's 8100/8081
+# bindings on top of its own and fails with "port is already allocated".
+#
+#   docker compose -p privoxy-canary -f docker-compose.canary.yml up -d --build
+#   docker compose -p privoxy-canary -f docker-compose.canary.yml down -v
 #
 # WARNING: this opens a SECOND ProtonVPN session. Check your plan's concurrent
 # device limit first — on a limited plan the canary can disconnect prod. If you
-# are session-limited, stop prod instead, run the canary, verify, then swap.
-#
-# Teardown:
-#   docker compose -p privoxy-canary \
-#     -f docker-compose.yml -f docker-compose.canary.yml down -v
+# are session-limited, use the in-place swap procedure instead.
 
 services:
   proton-privoxy:
+    build: .
     container_name: proton_privoxy_canary
     ports:
       - "127.0.0.1:18100:8100"   # canary proxy
       - "127.0.0.1:18081:8081"   # canary health/metrics
+    cap_add:
+      - NET_ADMIN
+    init: true
+    env_file:
+      - .env
     environment:
       # Stage 1: prove the SAFETY fixes (kill switch, drain, clean SIGTERM,
       # ACLs, timeouts) with none of the new ejection logic in play.
@@ -24,8 +30,11 @@ services:
       # Short cycle so a full rotation + drain is observable in minutes
       # instead of a day. Nothing else needs retuning while scoring is off.
       ROTATION_INTERVAL: "300"
+    restart: "no"                # a canary should stay dead so you see it died
     volumes:
       - canary_state:/var/lib/proxy
+    pids_limit: 512
+    mem_limit: 256m
 
 volumes:
   canary_state:

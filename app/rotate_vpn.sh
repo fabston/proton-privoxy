@@ -386,13 +386,32 @@ run_cycle() {
       return 1
     fi
 
+    # Heartbeat. The state file carries a timestamp that /ready checks for
+    # staleness — without refreshing it every tick, a supervisor that hung
+    # mid-cycle would keep reporting "ready" off a file written hours ago.
+    # Rewriting it here is what makes readiness a liveness signal for THIS
+    # loop rather than an echo of the last state transition.
+    set_state ready "$_rc_ep"
+
     # The kill-switch check above runs every tick. Sampling and scoring run on
     # the slower SAMPLE_INTERVAL so the statistics describe the endpoint rather
     # than the last 45 seconds of it.
     _rc_since_sample=$((_rc_since_sample + VPN_WATCHDOG_INTERVAL))
-    if [ "$ENDPOINT_SCORING_ENABLED" = "1" ] && [ "$_rc_since_sample" -ge "$SAMPLE_INTERVAL" ]; then
+    _rc_sample_due=0
+    if [ "$_rc_since_sample" -ge "$SAMPLE_INTERVAL" ]; then
       _rc_since_sample=0
-      _rc_got=0
+      _rc_sample_due=1
+
+      # Operational facts, collected whether or not scoring is on: these are
+      # the series you alert on, and they were previously unavailable at all
+      # when ENDPOINT_SCORING_ENABLED=0.
+      TUNNEL_UP=1                       # vpn_tunnel_alive passed above
+      PRIVOXY_UP=0
+      kill -0 "$privoxy_pid" 2>/dev/null && PRIVOXY_UP=1
+      CLIENT_CONNS=$(proxy_conn_count)
+    fi
+
+    if [ "$ENDPOINT_SCORING_ENABLED" = "1" ] && [ "$_rc_sample_due" -eq 1 ]; then
       # Computed BEFORE recording: stats_record uses it to freeze the baseline
       # while a sample is already anomalous, so a sustained degradation cannot
       # teach the detector to treat itself as normal.
@@ -456,7 +475,13 @@ run_cycle() {
           ;;
       esac
 
-      stats_render_metrics "$_rc_ep" "$_rc_fleet" "$ALL_DEGRADED" "$_rc_frozen"
+    fi
+
+    # Rendered outside the scoring block so /metrics still serves the
+    # operational series (tunnel up, client connections, rotation counters)
+    # when ENDPOINT_SCORING_ENABLED=0. Previously it returned 503 forever.
+    if [ "$_rc_sample_due" -eq 1 ]; then
+      stats_render_metrics "$_rc_ep" "$(stats_fleet_baseline)" "$ALL_DEGRADED" "${_rc_frozen:-0}"
     fi
 
     interruptible_sleep "$VPN_WATCHDOG_INTERVAL"
@@ -563,6 +588,7 @@ while true; do
 
   echo ""
   echo "----------------------------------------------------"
+  CYCLE_START_TS=$(date +%s)
   logi "event=cycle_start endpoint=$ENDPOINT_NAME state=$(stats_field "$ENDPOINT_NAME" 7) seconds=$CYCLE_SECONDS all_degraded=$ALL_DEGRADED"
   echo "Full config path: $PVPN_OVPN_FILE_PATH"
   echo "----------------------------------------------------"
@@ -701,6 +727,7 @@ while true; do
         set_state ready "$ENDPOINT_NAME"
         echo "Attempting to get current external IP..."
         current_ip=$(wget -T 10 -qO- http://ipv4.icanhazip.com || wget -T 10 -qO- http://ifconfig.me/ip || echo "N/A")
+        ACTIVE_EXIT_IP="$current_ip"
         logi "event=exit_ip endpoint=$ENDPOINT_NAME ip=$current_ip"
 
         # Supervised cycle. Replaces the blocking `sleep $ROTATION_INTERVAL`,
@@ -712,6 +739,9 @@ while true; do
           ROTATION_REASON="scheduled"
         fi
         logi "event=cycle_end endpoint=$ENDPOINT_NAME reason=$ROTATION_REASON"
+        # Counted, not just logged: rotation rate by reason is the single most
+        # useful thing to alert on, and it was previously grep-only.
+        counter_inc "$ROTATION_REASON"
 
         # Half-open trial that neither tripped nor demonstrably recovered stays
         # half-open; it gets another short trial rather than full traffic.

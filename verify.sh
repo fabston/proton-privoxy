@@ -84,8 +84,29 @@ case "$_r" in
   "")          fail "/ready returned nothing" ;;
   *)           warn "/ready not ready — $_r (normal during a rotation)" ;;
 esac
-_m=$(curl -s -m 5 "http://$HEALTH/metrics" 2>/dev/null | grep -c '^proxy_')
-if [ "${_m:-0}" -gt 0 ]; then pass "/metrics exposing $_m series"; else fail "/metrics empty — scoring may be off, or no samples yet"; fi
+_mtx=$(curl -s -m 5 "http://$HEALTH/metrics" 2>/dev/null)
+_m=$(printf '%s\n' "$_mtx" | grep -c '^proxy_')
+if [ "${_m:-0}" -gt 0 ]; then pass "/metrics exposing $_m series"; else fail "/metrics empty"; fi
+
+# Supervisor heartbeat: the failure mode where every other signal looks fine.
+_age=$(printf '%s\n' "$_mtx" | awk '/^proxy_state_age_seconds/{print $2}')
+if [ -z "$_age" ]; then
+  warn "no proxy_state_age_seconds — old image?"
+elif [ "$_age" -lt 0 ]; then
+  fail "supervisor state file unreadable"
+elif [ "$_age" -gt 60 ]; then
+  fail "supervisor heartbeat ${_age}s old — the rotation loop is wedged"
+else
+  pass "supervisor heartbeat ${_age}s old"
+fi
+
+_rot=$(printf '%s\n' "$_mtx" | grep '^proxy_rotations_total' | sed 's/proxy_rotations_total//')
+if [ -n "$_rot" ]; then
+  echo "        rotations by reason:"
+  printf '%s\n' "$_rot" | sed 's/^/          /'
+fi
+_conns=$(printf '%s\n' "$_mtx" | awk '/^proxy_client_connections/{print $2}')
+[ -n "$_conns" ] && echo "        client connections right now: $_conns"
 
 head_ "5. Privoxy config"
 if docker logs "$CONTAINER" 2>&1 | grep -q "unrecognized directive"; then

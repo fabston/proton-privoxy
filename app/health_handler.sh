@@ -7,6 +7,10 @@
 STATE_FILE="${STATE_FILE:-/var/lib/proxy/state}"
 METRICS_FILE="${METRICS_FILE:-/var/lib/proxy/metrics.prom}"
 MAX_HEADERS="${HEALTH_MAX_HEADERS:-64}"
+# /ready fails if the supervisor has not refreshed its state within this many
+# seconds. Must comfortably exceed VPN_WATCHDOG_INTERVAL (default 5s), since
+# that is the refresh cadence; 60 tolerates a slow tick without masking a hang.
+MAX_STATE_AGE="${HEALTH_MAX_STATE_AGE:-60}"
 
 # Send HTTP response with JSON body (ASCII only; Content-Length = byte length of body).
 send_json() {
@@ -72,7 +76,19 @@ read_state() {
 }
 read_endpoint() {
   [ -r "$STATE_FILE" ] || { echo ""; return; }
-  awk 'NR == 1 { print $2 }' "$STATE_FILE" 2>/dev/null
+  awk 'NR == 1 { print ($2 == "-" ? "" : $2) }' "$STATE_FILE" 2>/dev/null
+}
+# Seconds since the supervisor last refreshed its state. The supervisor
+# rewrites this every VPN_WATCHDOG_INTERVAL, so a growing age means the
+# supervisor loop is wedged — the one failure mode where every other signal
+# still looks healthy (privoxy up, tunnel up, last known state "ready").
+state_age() {
+  [ -r "$STATE_FILE" ] || { echo -1; return; }
+  _sa_ts=$(awk 'NR == 1 { print $3 }' "$STATE_FILE" 2>/dev/null)
+  case "$_sa_ts" in
+    ''|*[!0-9]*) echo -1; return ;;
+  esac
+  echo $(( $(date +%s) - _sa_ts ))
 }
 
 case "$path" in
@@ -82,18 +98,47 @@ case "$path" in
   /ready)
     _st=$(read_state)
     _ep=$(read_endpoint)
-    if [ "$_st" = "ready" ] && pgrep -x privoxy >/dev/null 2>&1; then
-      send_json "HTTP/1.1 200 OK" "{\"status\":\"ready\",\"endpoint\":\"${_ep}\"}"
-    else
+    _age=$(state_age)
+    if [ "$_st" != "ready" ]; then
       send_json "HTTP/1.1 503 Service Unavailable" \
-        "{\"status\":\"not_ready\",\"state\":\"${_st}\",\"endpoint\":\"${_ep}\"}"
+        "{\"status\":\"not_ready\",\"reason\":\"state\",\"state\":\"${_st}\",\"endpoint\":\"${_ep}\",\"state_age_s\":${_age}}"
+    elif ! pgrep -x privoxy >/dev/null 2>&1; then
+      send_json "HTTP/1.1 503 Service Unavailable" \
+        "{\"status\":\"not_ready\",\"reason\":\"privoxy_down\",\"state\":\"${_st}\",\"endpoint\":\"${_ep}\",\"state_age_s\":${_age}}"
+    elif [ "$_age" -lt 0 ] || [ "$_age" -gt "$MAX_STATE_AGE" ]; then
+      # State says ready but nothing has refreshed it. The supervisor loop is
+      # wedged; serving traffic on that basis is exactly the silent failure
+      # this endpoint exists to prevent.
+      send_json "HTTP/1.1 503 Service Unavailable" \
+        "{\"status\":\"not_ready\",\"reason\":\"stale_state\",\"state\":\"${_st}\",\"endpoint\":\"${_ep}\",\"state_age_s\":${_age},\"max_age_s\":${MAX_STATE_AGE}}"
+    else
+      send_json "HTTP/1.1 200 OK" \
+        "{\"status\":\"ready\",\"endpoint\":\"${_ep}\",\"state_age_s\":${_age}}"
     fi
     ;;
   /metrics)
+    # Staleness and readiness are computed at SCRAPE time, not render time —
+    # baking them into the rendered file would make them describe the moment
+    # the supervisor last ran, which is the very thing being measured.
+    _age=$(state_age)
+    _ready=0
+    [ "$(read_state)" = "ready" ] && [ "$_age" -ge 0 ] && [ "$_age" -le "$MAX_STATE_AGE" ] \
+      && pgrep -x privoxy >/dev/null 2>&1 && _ready=1
+    _live="# HELP proxy_state_age_seconds Seconds since the supervisor refreshed its state.
+# TYPE proxy_state_age_seconds gauge
+proxy_state_age_seconds ${_age}
+# HELP proxy_ready 1 when /ready would return 200.
+# TYPE proxy_ready gauge
+proxy_ready ${_ready}
+# HELP proxy_up 1 whenever this endpoint can answer at all.
+# TYPE proxy_up gauge
+proxy_up 1"
     if [ -r "$METRICS_FILE" ]; then
-      send_text "HTTP/1.1 200 OK" "text/plain; version=0.0.4; charset=utf-8" "$(cat "$METRICS_FILE")"
+      send_text "HTTP/1.1 200 OK" "text/plain; version=0.0.4; charset=utf-8" \
+        "$(cat "$METRICS_FILE")
+${_live}"
     else
-      send_text "HTTP/1.1 503 Service Unavailable" "text/plain; charset=utf-8" "# metrics not yet rendered"
+      send_text "HTTP/1.1 200 OK" "text/plain; version=0.0.4; charset=utf-8" "${_live}"
     fi
     ;;
   *)

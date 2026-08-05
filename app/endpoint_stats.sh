@@ -73,6 +73,24 @@ stats_init() {
 # stats_now — epoch seconds
 stats_now() { date +%s; }
 
+# ---------------------------------------------------------------------------
+# counter_inc <name>
+#
+# Monotonic counters persisted alongside the stats, so "how often is this
+# thing rotating, and why" is answerable from metrics instead of by grepping
+# logs. Survives restarts via the same volume.
+# ---------------------------------------------------------------------------
+counter_inc() {
+  _ci_f="${STATS_DIR}/counters"
+  [ -f "$_ci_f" ] || : > "$_ci_f"
+  _ci_tmp="${_ci_f}.tmp.$$"
+  awk -v n="$1" '
+    $1 == n { printf "%s %d\n", $1, $2 + 1; found = 1; next }
+    { print }
+    END { if (!found) printf "%s 1\n", n }
+  ' "$_ci_f" > "$_ci_tmp" && mv -f "$_ci_tmp" "$_ci_f"
+}
+
 # _stats_write <tmpfile> — atomically replace the stats file
 _stats_write() {
   mv -f "$1" "$STATS_FILE"
@@ -451,6 +469,33 @@ stats_render_metrics() {
       echo "# HELP proxy_passive_rtt_ms not used for scoring, it is a different scale to the probe."
       echo "# TYPE proxy_passive_rtt_ms gauge"
       echo "proxy_passive_rtt_ms{endpoint=\"$_rm_active\"} $PASSIVE_RTT_MS"
+    fi
+
+    # --- Operational series: emitted whether or not scoring is enabled, ---
+    # --- because these are what you alert on.                           ---
+    echo "# HELP proxy_tunnel_up 1 when egress verifiably goes via the VPN interface."
+    echo "# TYPE proxy_tunnel_up gauge"
+    echo "proxy_tunnel_up ${TUNNEL_UP:-0}"
+    echo "# HELP proxy_privoxy_up 1 when the proxy process is running."
+    echo "# TYPE proxy_privoxy_up gauge"
+    echo "proxy_privoxy_up ${PRIVOXY_UP:-0}"
+    echo "# HELP proxy_client_connections Established client connections on the proxy port."
+    echo "# TYPE proxy_client_connections gauge"
+    echo "proxy_client_connections ${CLIENT_CONNS:-0}"
+    if [ -n "$CYCLE_START_TS" ]; then
+      echo "# HELP proxy_cycle_start_timestamp_seconds When the current endpoint took over."
+      echo "# TYPE proxy_cycle_start_timestamp_seconds gauge"
+      echo "proxy_cycle_start_timestamp_seconds $CYCLE_START_TS"
+    fi
+    if [ -n "$ACTIVE_EXIT_IP" ]; then
+      echo "# HELP proxy_exit_ip_info Current public egress IP, as a label."
+      echo "# TYPE proxy_exit_ip_info gauge"
+      echo "proxy_exit_ip_info{ip=\"$ACTIVE_EXIT_IP\",endpoint=\"$_rm_active\"} 1"
+    fi
+    if [ -f "${STATS_DIR}/counters" ]; then
+      echo "# HELP proxy_rotations_total Rotations by reason since first start."
+      echo "# TYPE proxy_rotations_total counter"
+      awk '{ printf "proxy_rotations_total{reason=\"%s\"} %s\n", $1, $2 }' "${STATS_DIR}/counters"
     fi
   } > "$_rm_tmp" 2>/dev/null && mv -f "$_rm_tmp" "$METRICS_FILE"
 }

@@ -27,8 +27,11 @@ VPN_WATCHDOG_INTERVAL=${VPN_WATCHDOG_INTERVAL:-5}
 # every 5s makes the EWMA span ~45s and the baseline ~8min, which on a long
 # cycle means an evening traffic peak is measured against an afternoon baseline
 # and reads as degradation. At 60s the baseline spans ~100min instead.
+# Also governs probe cadence: the probe is the scoring signal and fires once
+# per sample tick. (There is no separate PROBE_INTERVAL — it existed when the
+# probe was only a fallback for thin traffic, and became a knob that did
+# nothing once the probe became the primary measurement.)
 SAMPLE_INTERVAL=${SAMPLE_INTERVAL:-60}
-PROBE_INTERVAL=${PROBE_INTERVAL:-60}
 PASSIVE_RTT_ENABLED=${PASSIVE_RTT_ENABLED:-1}
 PASSIVE_MIN_SOCKETS=${PASSIVE_MIN_SOCKETS:-2}
 HALF_OPEN_INTERVAL=${HALF_OPEN_INTERVAL:-60}
@@ -365,7 +368,6 @@ ROTATION_REASON="scheduled"
 run_cycle() {
   _rc_ep="$1"; _rc_dur="$2"
   _rc_elapsed=0
-  _rc_since_probe=$PROBE_INTERVAL
   _rc_since_sample=$SAMPLE_INTERVAL
   _rc_target_idx=0
   ROTATION_REASON="scheduled"
@@ -396,28 +398,34 @@ run_cycle() {
       # teach the detector to treat itself as normal.
       _rc_fleet=$(stats_fleet_baseline)
 
-      # Tier 1: passive, from live traffic.
+      # Passive kernel RTT — INFORMATIONAL ONLY, never scored.
+      #
+      # It measures one transport round trip (~5ms here); the probe measures a
+      # full proxied request (~33ms here). Feeding both into one EWMA meant an
+      # endpoint's score depended on whether client traffic happened to be
+      # flowing during its cycle rather than on the endpoint itself, which
+      # destroys the premise of comparing endpoints against a fleet median.
+      # Two scales, one average, is not a measurement.
+      PASSIVE_RTT_MS=""
       if [ "$PASSIVE_RTT_ENABLED" = "1" ]; then
         _rc_p=$(passive_rtt 2>/dev/null || echo "0 0")
         _rc_rtt=${_rc_p% *}; _rc_sock=${_rc_p#* }
         if [ "${_rc_sock:-0}" -ge "$PASSIVE_MIN_SOCKETS" ]; then
-          stats_record "$_rc_ep" "$_rc_rtt" 0 "$_rc_fleet"
-          _rc_got=1
-          logd "endpoint=$_rc_ep sample=passive rtt_ms=$_rc_rtt sockets=$_rc_sock"
+          PASSIVE_RTT_MS="$_rc_rtt"
+          logd "endpoint=$_rc_ep observed=passive rtt_ms=$_rc_rtt sockets=$_rc_sock"
         fi
       fi
 
-      # Tier 2: in-path probe, only when live traffic was too thin to judge.
-      _rc_since_probe=$((_rc_since_probe + SAMPLE_INTERVAL))
-      if [ "$_rc_got" -eq 0 ] && [ "$_rc_since_probe" -ge "$PROBE_INTERVAL" ] \
-         && [ "$_rc_ntargets" -gt 0 ] && probe_clock_ok; then
+      # The in-path probe is the single scoring signal: it always runs, and it
+      # always measures the same thing, so samples are comparable across
+      # endpoints and across cycles regardless of traffic levels.
+      if [ "$_rc_ntargets" -gt 0 ] && probe_clock_ok; then
         _rc_target_idx=$(( (_rc_target_idx % _rc_ntargets) + 1 ))
         eval "_rc_url=\${$_rc_target_idx}"
         _rc_r=$(probe_ttfb "$_rc_url" 2>/dev/null || echo "0 1")
         _rc_ttfb=${_rc_r% *}; _rc_err=${_rc_r#* }
         stats_record "$_rc_ep" "$_rc_ttfb" "$_rc_err" "$_rc_fleet"
-        _rc_since_probe=0
-        logd "endpoint=$_rc_ep sample=probe url=$_rc_url ttfb_ms=$_rc_ttfb err=$_rc_err"
+        logd "endpoint=$_rc_ep sample=probe url=$_rc_url ms=$_rc_ttfb err=$_rc_err"
       fi
 
       # Evaluate against the baseline as of AFTER this sample landed. A trip

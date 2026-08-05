@@ -446,5 +446,11 @@ stats_render_metrics() {
       echo "# TYPE proxy_active_endpoint gauge"
       echo "proxy_active_endpoint{endpoint=\"$_rm_active\"} 1"
     fi
+    if [ -n "$PASSIVE_RTT_MS" ]; then
+      echo "# HELP proxy_passive_rtt_ms Kernel RTT of live proxied sockets. Informational:"
+      echo "# HELP proxy_passive_rtt_ms not used for scoring, it is a different scale to the probe."
+      echo "# TYPE proxy_passive_rtt_ms gauge"
+      echo "proxy_passive_rtt_ms{endpoint=\"$_rm_active\"} $PASSIVE_RTT_MS"
+    fi
   } > "$_rm_tmp" 2>/dev/null && mv -f "$_rm_tmp" "$METRICS_FILE"
 }

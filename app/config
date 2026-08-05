@@ -11,10 +11,76 @@ confdir /etc/privoxy
 logdir /var/log/privoxy
 
 # logfile: Name of the logfile within logdir.
+#
+# WARNING: this writes to the container's writable layer with no rotation. At
+# `debug 4096` the volume is negligible, but raising `debug` (see below) will
+# fill the disk with nothing to truncate it. To send Privoxy's log to the
+# container's stdout instead — where Docker's log driver can rotate it —
+# comment out both `logdir` and `logfile` and Privoxy logs to stderr.
 logfile logfile
 
 # listen-address: IP address and port Privoxy listens on.
 listen-address  0.0.0.0:8100
+
+############################################################################
+# ACCESS CONTROL — READ THIS BEFORE DEPLOYING
+############################################################################
+# Privoxy grants access to everyone when no permit-access line is present.
+# Combined with `listen-address 0.0.0.0` and a published host port, that is an
+# open forward proxy: anyone who finds it can relay traffic through your
+# ProtonVPN account. Open proxies are scanned for and found within hours.
+#
+# Uncomment and narrow these to the networks that should be allowed. The
+# defaults below permit only loopback and RFC1918 space, which is correct when
+# the proxy is reached over a Docker network or a private LAN.
+#
+# NOTE: ACLs require a Privoxy built with FEATURE_ACL. Verify with
+#   privoxy --version   (or check the startup banner in the log)
+# If your build lacks it, enforce the equivalent at the host firewall or by
+# publishing the port only on 127.0.0.1 in docker-compose.yml.
+permit-access 127.0.0.1
+permit-access 10.0.0.0/8
+permit-access 172.16.0.0/12
+permit-access 192.168.0.0/16
+
+############################################################################
+# CONNECTION LIFECYCLE AND TIMEOUTS
+############################################################################
+# socket-timeout: how long Privoxy waits on a socket with no data before
+# giving up. Privoxy's documented default is 300s; a client stuck behind a
+# black-holed tunnel would sit for five minutes before learning anything.
+# 60s is well inside the rotation interval, so a stalled request surfaces as
+# an error rather than a hang that outlives the endpoint serving it.
+socket-timeout 60
+
+# connect-timeout: cap on the upstream TCP connect. Without it a connect
+# attempt into a dead tunnel is bounded only by the kernel's SYN retry
+# schedule (~130s), which is longer than a whole rotation cycle.
+connect-timeout 15
+
+# keep-alive-timeout: enables client-side keep-alive and bounds how long an
+# idle client connection is held. Leaving this unset means a new TCP
+# connection (and a new upstream connection) per request.
+keep-alive-timeout 20
+
+# max-client-connections: bounds concurrent client connections so a slow-client
+# flood cannot exhaust file descriptors. Privoxy's documented default is 128;
+# raise deliberately after measuring, do not leave it implicit.
+max-client-connections 256
+
+# Do not reuse an upstream connection across different clients. With one shared
+# egress IP this is a privacy boundary, not just a correctness one.
+connection-sharing 0
+
+# Refuse requests that did not come through an explicit proxy configuration.
+# Guards against this port being used as a transparent interception target.
+accept-intercepted-requests 0
+
+# Remote toggle / edit interfaces off. All default to off, but a proxy that is
+# reachable from anything but loopback should say so explicitly.
+enable-remote-toggle 0
+enable-remote-http-toggle 0
+enable-edit-actions 0
 
 # actionsfile: Defines Privoxy's filtering behavior based on URLs.
 # These will point to the (empty) files copied by the Dockerfile.
@@ -36,10 +102,18 @@ filterfile default.filter
 # filterfile user.filter
 
 # Debugging levels:
-# 4096: Log startup banner and warnings (good for normal operation).
-# To see all requests: debug 1
-# For very verbose troubleshooting (can be noisy): debug 13313
-# (1=requests, 1024=header/action info, 4096=startup, 8192=remote connections)
-debug   4096
+#    1 = each request received
+# 1024 = actions/header info
+# 4096 = startup banner and warnings
+# 8192 = errors talking to the upstream server (connect failures, timeouts)
+#
+# 4096 alone logs neither requests nor upstream failures, which means there is
+# no record of what the proxy did with any request — you cannot tell a client
+# error from an exit-server error after the fact.
+#
+# 4096+8192 = 12288 gives upstream failure visibility at negligible volume and
+# is the right default for production. Add 1 (=12289) to log every request,
+# but note that with `logfile` set and no rotation that grows unbounded.
+debug   12288
 
 

@@ -1,0 +1,31 @@
+# Canary overlay — run the new image ALONGSIDE prod before swapping it in.
+#
+#   docker compose -p privoxy-canary \
+#     -f docker-compose.yml -f docker-compose.canary.yml up -d --build
+#
+# WARNING: this opens a SECOND ProtonVPN session. Check your plan's concurrent
+# device limit first — on a limited plan the canary can disconnect prod. If you
+# are session-limited, stop prod instead, run the canary, verify, then swap.
+#
+# Teardown:
+#   docker compose -p privoxy-canary \
+#     -f docker-compose.yml -f docker-compose.canary.yml down -v
+
+services:
+  proton-privoxy:
+    container_name: proton_privoxy_canary
+    ports:
+      - "127.0.0.1:18100:8100"   # canary proxy
+      - "127.0.0.1:18081:8081"   # canary health/metrics
+    environment:
+      # Stage 1: prove the SAFETY fixes (kill switch, drain, clean SIGTERM,
+      # ACLs, timeouts) with none of the new ejection logic in play.
+      ENDPOINT_SCORING_ENABLED: "0"
+      # Short cycle so a full rotation + drain is observable in minutes
+      # instead of a day. Nothing else needs retuning while scoring is off.
+      ROTATION_INTERVAL: "300"
+    volumes:
+      - canary_state:/var/lib/proxy
+
+volumes:
+  canary_state:

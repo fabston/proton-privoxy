@@ -4,19 +4,70 @@ services:
   proton-privoxy:
     build: .
     container_name: proton_privoxy_service
+    ####################################################################
+    # EXPOSURE — PICK ONE BEFORE DEPLOYING. Default below is fail-safe
+    # (loopback), which WILL break you if clients connect from off-box.
+    #
+    # A) Clients run on this same VPS, in other containers  <-- best
+    #    Delete the `ports:` block entirely and put both containers on a
+    #    shared docker network. Reach it as http://proton-privoxy:8100.
+    #    Nothing is published to the host at all.
+    #
+    # B) Clients run on this VPS, outside Docker
+    #    Keep the loopback bind below. Reach it as http://127.0.0.1:8100.
+    #
+    # C) Clients are remote (another host)
+    #    Bind to a private interface, NOT 0.0.0.0:
+    #      - "10.0.0.5:8100:8100"        # WireGuard/private NIC address
+    #    and keep the permit-access rules in app/config, and allowlist the
+    #    source in your cloud firewall / ufw. On a VPS, 0.0.0.0 means the
+    #    public internet — an unauthenticated open proxy relaying through
+    #    your ProtonVPN account.
+    ####################################################################
     ports:
-      - "0.0.0.0:8100:8100" # Privoxy HTTP proxy
-      - "0.0.0.0:8081:8081" # Liveness/readiness: GET /health, GET /ready (see HEALTH_PORT)
-                              # Change bind or ports if needed for your network
+      - "127.0.0.1:8100:8100"   # Privoxy HTTP proxy
+      - "127.0.0.1:8081:8081"   # GET /health, /ready, /metrics (see HEALTH_PORT)
     cap_add:
       - NET_ADMIN             # Required for OpenVPN to modify network interfaces and routes
-    # devices:                # Usually not needed if mknod in app/run works for /dev/net/tun
+    # devices:                # Left commented: the mknod in app/run already works
     #   - "/dev/net/tun:/dev/net/tun"
+    # A `devices:` mapping is cleaner, but if the VPS host has no
+    # /dev/net/tun (some OpenVZ/LXC hosts) Docker refuses to START the
+    # container, whereas the mknod fallback in app/run just creates it.
+    # Not worth trading a working deployment for tidiness.
+    # PID 1 reaper. OpenVPN is started with --daemon, so it double-forks and is
+    # re-parented to PID 1. A shell does not reap orphans it never spawned, so
+    # every rotation left a zombie that `pgrep -x openvpn` still matches.
+    init: true
     env_file:
       - .env                  # Load environment variables from .env file
     restart: unless-stopped
+    volumes:
+      # Endpoint latency history and degradation state. Without this the
+      # scorer relearns every endpoint from zero on each restart, and an exit
+      # that was ejected 10 minutes ago immediately gets traffic again.
+      - proxy_state:/var/lib/proxy
+    healthcheck:
+      # The readiness endpoint existed but nothing consumed it, so a container
+      # with a dead tunnel still looked healthy to Docker and to anything
+      # orchestrating it.
+      test: ["CMD", "sh", "-c", "wget -q -T 3 -O /dev/null http://127.0.0.1:${HEALTH_PORT:-8081}/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s       # First VPN connect can take up to VPN_CONNECT_TIMEOUT
+    # Bound the blast radius of a fork/connection flood on either listener.
+    pids_limit: 512
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Optional: Uncomment and set specific DNS if needed (will be used by container *before* VPN might change it)
     # dns:
     #   - 1.1.1.1
     #   - 1.0.0.1
 
+volumes:
+  proxy_state:

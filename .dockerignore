@@ -1,0 +1,9 @@
+# Keep secrets and local state out of the build context. .env is not COPYed
+# into the image, but it is still uploaded to the Docker daemon without this.
+.env
+.env.*
+!.env.example.txt
+my_host_auth.txt
+.git
+.gitignore
+README.md

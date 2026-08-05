@@ -13,6 +13,46 @@ ROTATION_INTERVAL_SECONDS=${ROTATION_INTERVAL:-300}
 VPN_CONNECT_TIMEOUT=${VPN_CONNECT_TIMEOUT:-45}
 OVPN_FILE_PATTERN=${OVPN_FILE_PATTERN:-*.ovpn}
 
+# --- ENDPOINT SCORING / DEGRADATION (see .env.example.txt) ---
+ENDPOINT_SCORING_ENABLED=${ENDPOINT_SCORING_ENABLED:-1}
+# Kill-switch cadence. Must stay fast and is independent of cycle length: it is
+# the ONLY thing checking the tunnel, and at ROTATION_INTERVAL=86400 it is the
+# difference between a 5-second leak and a 22-hour one.
+VPN_WATCHDOG_INTERVAL=${VPN_WATCHDOG_INTERVAL:-5}
+# Latency sampling cadence, deliberately decoupled from the watchdog. Sampling
+# every 5s makes the EWMA span ~45s and the baseline ~8min, which on a long
+# cycle means an evening traffic peak is measured against an afternoon baseline
+# and reads as degradation. At 60s the baseline spans ~100min instead.
+SAMPLE_INTERVAL=${SAMPLE_INTERVAL:-60}
+PROBE_INTERVAL=${PROBE_INTERVAL:-60}
+PASSIVE_RTT_ENABLED=${PASSIVE_RTT_ENABLED:-1}
+PASSIVE_MIN_SOCKETS=${PASSIVE_MIN_SOCKETS:-2}
+HALF_OPEN_INTERVAL=${HALF_OPEN_INTERVAL:-60}
+DRAIN_GRACE=${DRAIN_GRACE:-10}
+PROXY_PORT=${PROXY_PORT:-8100}
+PROBE_TARGETS=${PROBE_TARGETS:-"http://ipv4.icanhazip.com/ http://ifconfig.me/ip"}
+STATE_FILE=${STATE_FILE:-/var/lib/proxy/state}
+DEBUG_LOG=${DEBUG_LOG:-0}
+
+. /app/endpoint_stats.sh
+. /app/probe_ttfb.sh
+
+# Structured, timestamped logging. The previous unconditional DEBUG echoes are
+# now gated on DEBUG_LOG so the rotation signal is not buried at 288 cycles/day.
+ts()    { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+logi()  { echo "$(ts) INFO  $*"; }
+logw()  { echo "$(ts) WARN  $*"; }
+loge()  { echo "$(ts) ERROR $*"; }
+logd()  { [ "$DEBUG_LOG" = "1" ] && echo "$(ts) DEBUG $*"; return 0; }
+
+# Readiness is published as a file so the health handler does not have to
+# re-derive it (and cannot disagree with the supervisor about the interface).
+set_state() {
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+  printf '%s %s %s\n' "$1" "${2:-}" "$(date +%s)" > "${STATE_FILE}.tmp.$$" \
+    && mv -f "${STATE_FILE}.tmp.$$" "$STATE_FILE"
+}
+
 # --- GLOBAL VARIABLES for file list ---
 # OVPN_FILE_LIST will hold newline-separated, shuffled file paths
 OVPN_FILE_LIST=""
@@ -118,9 +158,27 @@ privoxy_pid=""
 # --- HEALTH HTTP (socat) PID ---
 health_socat_pid=""
 
+# --- SHUTDOWN FLAG ---
+# Set by the INT/TERM handler; every wait point in the main loop polls it.
+# The handler itself must be cheap and must NOT tear anything down: the actual
+# teardown runs once, from the EXIT trap.
+_shutdown=0
+_cleanup_done=0
+
+on_signal() {
+  _shutdown=1
+  logw "event=signal_received action=drain_and_exit"
+  set_state draining ""
+}
+
 # --- FUNCTION TO CLEANUP PROCESSES ---
 cleanup() {
+  [ "$_cleanup_done" = "1" ] && return 0
+  _cleanup_done=1
   echo "Caught signal or exiting, cleaning up..."
+  set_state stopping ""
+  # Let in-flight proxy requests finish before the listener dies.
+  drain_privoxy
   if [ -n "$health_socat_pid" ] && kill -0 "$health_socat_pid" 2>/dev/null; then
     echo "Stopping health HTTP listener (PID: $health_socat_pid)..."
     kill "$health_socat_pid" 2>/dev/null || true
@@ -166,7 +224,264 @@ cleanup() {
   echo "Cleanup complete."
 }
 
-trap cleanup INT TERM EXIT
+# INT/TERM only flag; EXIT does the teardown. Keeping them separate avoids the
+# re-entrancy bug where the signal handler tears down and then the EXIT trap
+# tears down again over a half-dead process tree.
+trap on_signal INT TERM
+trap cleanup EXIT
+
+############################################################################
+#            CONNECTION DRAINING, TUNNEL WATCHDOG, CYCLE SUPERVISOR        #
+############################################################################
+
+# ---------------------------------------------------------------------------
+# drain_privoxy
+#
+# Rotation used to SIGKILL-adjacent Privoxy while requests were in flight, so
+# every CONNECT tunnel and keep-alive connection died mid-response. Now we
+# stop accepting (SIGTERM) and then wait for established client sockets on the
+# proxy port to fall to zero, bounded by DRAIN_GRACE.
+#
+# The socket count comes from `ss` rather than from Privoxy's own behaviour so
+# the drain is verifiable without depending on Privoxy internals.
+# ---------------------------------------------------------------------------
+proxy_conn_count() {
+  # `wc -l`, not `grep -c .`: grep prints 0 AND exits non-zero on no match, so
+  # a `|| echo 0` fallback emits two lines and breaks the numeric comparison.
+  ss -Htn state established "sport = :${PROXY_PORT}" 2>/dev/null | wc -l | tr -d ' '
+}
+
+drain_privoxy() {
+  [ -n "$privoxy_pid" ] || return 0
+  kill -0 "$privoxy_pid" 2>/dev/null || { privoxy_pid=""; return 0; }
+
+  _dr_start_conns=$(proxy_conn_count)
+  logi "event=drain_begin pid=$privoxy_pid inflight=$_dr_start_conns grace=${DRAIN_GRACE}s"
+  kill -TERM "$privoxy_pid" 2>/dev/null || true
+
+  _dr=0
+  while [ "$_dr" -lt "$DRAIN_GRACE" ]; do
+    kill -0 "$privoxy_pid" 2>/dev/null || break
+    [ "$(proxy_conn_count)" -eq 0 ] && break
+    sleep 1
+    _dr=$((_dr + 1))
+  done
+
+  _dr_left=$(proxy_conn_count)
+  if kill -0 "$privoxy_pid" 2>/dev/null; then
+    [ "$_dr_left" -gt 0 ] && logw "event=drain_timeout aborted_connections=$_dr_left"
+    kill -KILL "$privoxy_pid" 2>/dev/null || true
+  fi
+  wait "$privoxy_pid" 2>/dev/null || true
+  logi "event=drain_end waited=${_dr}s aborted=$_dr_left"
+  privoxy_pid=""
+}
+
+# ---------------------------------------------------------------------------
+# vpn_tunnel_alive — the kill switch
+#
+# The .ovpn files ship `persist-tun`, so tun0 keeps its IPv4 address while the
+# tunnel is DOWN and reconnecting. An "interface has an inet" check therefore
+# proves nothing. Three things must all hold:
+#   1. an openvpn process exists and is not a zombie
+#   2. the tun interface still carries the default route
+#   3. the interface is administratively up
+# If any fails we rotate immediately rather than serve through a dead or
+# leaking path.
+# ---------------------------------------------------------------------------
+openvpn_running() {
+  # `pgrep` matches zombies; exclude them so a reaped-but-unwaited openvpn
+  # cannot masquerade as a live tunnel.
+  pgrep -x openvpn 2>/dev/null | while read -r _p; do
+    _st=$(awk '{print $3}' "/proc/$_p/stat" 2>/dev/null)
+    [ "$_st" = "Z" ] || { echo live; break; }
+  done | grep -q live
+}
+
+vpn_tunnel_alive() {
+  openvpn_running || { logd "tunnel_check=fail reason=no_openvpn"; return 1; }
+  ip route show default 2>/dev/null | grep -q "dev $VPN_INTERFACE" \
+    || { logd "tunnel_check=fail reason=default_route_not_on_$VPN_INTERFACE"; return 1; }
+  ip link show "$VPN_INTERFACE" 2>/dev/null | grep -q "state UNKNOWN\|state UP\|UP," \
+    || { logd "tunnel_check=fail reason=iface_down"; return 1; }
+  return 0
+}
+
+# interruptible_sleep <seconds> — a bare `sleep` blocks trap delivery until it
+# returns, which is why `docker stop` used to sit for its full grace period
+# and then SIGKILL. Backgrounding it and using `wait` makes the shell
+# interruptible, because POSIX `wait` is interrupted by a trapped signal.
+interruptible_sleep() {
+  sleep "$1" &
+  _is_pid=$!
+  wait "$_is_pid" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# run_cycle <endpoint_name> <duration_seconds>
+#
+# Replaces the old blocking `sleep $ROTATION_INTERVAL`. Every tick it:
+#   1. checks the tunnel (kill switch)
+#   2. takes a passive RTT sample from real proxied sockets
+#   3. falls back to an in-path TTFB probe when traffic was too thin
+#   4. re-evaluates the endpoint and trips it if it has degraded
+#   5. re-renders metrics
+#
+# Exit status: 0 = interval completed normally, 1 = cut short (reason in
+# $ROTATION_REASON).
+# ---------------------------------------------------------------------------
+ROTATION_REASON="scheduled"
+
+run_cycle() {
+  _rc_ep="$1"; _rc_dur="$2"
+  _rc_elapsed=0
+  _rc_since_probe=$PROBE_INTERVAL
+  _rc_since_sample=$SAMPLE_INTERVAL
+  _rc_target_idx=0
+  ROTATION_REASON="scheduled"
+
+  # shellcheck disable=SC2086
+  set -- $PROBE_TARGETS
+  _rc_ntargets=$#
+
+  while [ "$_rc_elapsed" -lt "$_rc_dur" ]; do
+    [ "$_shutdown" = "1" ] && { ROTATION_REASON="shutdown"; return 1; }
+
+    if ! vpn_tunnel_alive; then
+      loge "endpoint=$_rc_ep event=tunnel_down action=rotate_now"
+      stats_record "$_rc_ep" 0 1
+      ROTATION_REASON="vpn_down"
+      return 1
+    fi
+
+    # The kill-switch check above runs every tick. Sampling and scoring run on
+    # the slower SAMPLE_INTERVAL so the statistics describe the endpoint rather
+    # than the last 45 seconds of it.
+    _rc_since_sample=$((_rc_since_sample + VPN_WATCHDOG_INTERVAL))
+    if [ "$ENDPOINT_SCORING_ENABLED" = "1" ] && [ "$_rc_since_sample" -ge "$SAMPLE_INTERVAL" ]; then
+      _rc_since_sample=0
+      _rc_got=0
+      # Computed BEFORE recording: stats_record uses it to freeze the baseline
+      # while a sample is already anomalous, so a sustained degradation cannot
+      # teach the detector to treat itself as normal.
+      _rc_fleet=$(stats_fleet_baseline)
+
+      # Tier 1: passive, from live traffic.
+      if [ "$PASSIVE_RTT_ENABLED" = "1" ]; then
+        _rc_p=$(passive_rtt 2>/dev/null || echo "0 0")
+        _rc_rtt=${_rc_p% *}; _rc_sock=${_rc_p#* }
+        if [ "${_rc_sock:-0}" -ge "$PASSIVE_MIN_SOCKETS" ]; then
+          stats_record "$_rc_ep" "$_rc_rtt" 0 "$_rc_fleet"
+          _rc_got=1
+          logd "endpoint=$_rc_ep sample=passive rtt_ms=$_rc_rtt sockets=$_rc_sock"
+        fi
+      fi
+
+      # Tier 2: in-path probe, only when live traffic was too thin to judge.
+      _rc_since_probe=$((_rc_since_probe + SAMPLE_INTERVAL))
+      if [ "$_rc_got" -eq 0 ] && [ "$_rc_since_probe" -ge "$PROBE_INTERVAL" ] \
+         && [ "$_rc_ntargets" -gt 0 ] && probe_clock_ok; then
+        _rc_target_idx=$(( (_rc_target_idx % _rc_ntargets) + 1 ))
+        eval "_rc_url=\${$_rc_target_idx}"
+        _rc_r=$(probe_ttfb "$_rc_url" 2>/dev/null || echo "0 1")
+        _rc_ttfb=${_rc_r% *}; _rc_err=${_rc_r#* }
+        stats_record "$_rc_ep" "$_rc_ttfb" "$_rc_err" "$_rc_fleet"
+        _rc_since_probe=0
+        logd "endpoint=$_rc_ep sample=probe url=$_rc_url ttfb_ms=$_rc_ttfb err=$_rc_err"
+      fi
+
+      # Evaluate against the baseline as of AFTER this sample landed. A trip
+      # cuts the cycle short so the bad exit stops carrying traffic now,
+      # rather than at the end of the interval.
+      _rc_fleet=$(stats_fleet_baseline)
+      _rc_frozen=0
+      stats_ejection_frozen && _rc_frozen=1
+      _rc_decision=$(stats_evaluate "$_rc_ep" "$_rc_fleet")
+
+      case "$_rc_decision" in
+        TRIP_SLOW|TRIP_ERR)
+          if [ "$_rc_frozen" = "1" ]; then
+            logw "endpoint=$_rc_ep event=trip_suppressed reason=$_rc_decision cause=ejection_circuit_breaker_open"
+          else
+            logw "endpoint=$_rc_ep event=trip reason=$_rc_decision ewma_ms=$(stats_field "$_rc_ep" 2) baseline_ms=$(stats_field "$_rc_ep" 4) fleet_ms=${_rc_fleet:-na} err=$(stats_field "$_rc_ep" 5)"
+            stats_trip "$_rc_ep" "$(stats_now)"
+            ROTATION_REASON="tripped"
+            stats_render_metrics "$_rc_ep" "$_rc_fleet" 0 "$_rc_frozen"
+            return 1
+          fi
+          ;;
+        RECOVER)
+          if [ "$(stats_field "$_rc_ep" 7)" = "HALF_OPEN" ]; then
+            logi "endpoint=$_rc_ep event=half_open_recovered ewma_ms=$(stats_field "$_rc_ep" 2) fleet_ms=${_rc_fleet:-na}"
+            stats_set_state "$_rc_ep" OK 0
+          fi
+          ;;
+      esac
+
+      stats_render_metrics "$_rc_ep" "$_rc_fleet" "$ALL_DEGRADED" "$_rc_frozen"
+    fi
+
+    interruptible_sleep "$VPN_WATCHDOG_INTERVAL"
+    _rc_elapsed=$((_rc_elapsed + VPN_WATCHDOG_INTERVAL))
+  done
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# select_endpoint
+#
+# Pops candidates off the shuffled list until one is selectable. Never
+# black-holes: if every candidate is ejected we take the least-bad one,
+# force it half-open and flag ALL_DEGRADED.
+# Sets CURRENT_OVPN_FILE, ENDPOINT_NAME, CYCLE_SECONDS, ALL_DEGRADED.
+# ---------------------------------------------------------------------------
+ALL_DEGRADED=0
+
+select_endpoint() {
+  stats_expire_cooldowns "$(stats_now)"
+  ALL_DEGRADED=0
+  _se_skipped=""
+
+  while get_next_ovpn_file; do
+    ENDPOINT_NAME=$(basename "$CURRENT_OVPN_FILE")
+    stats_ensure "$ENDPOINT_NAME"
+
+    if [ "$ENDPOINT_SCORING_ENABLED" != "1" ] || stats_selectable "$ENDPOINT_NAME"; then
+      if [ "$(stats_field "$ENDPOINT_NAME" 7)" = "HALF_OPEN" ]; then
+        CYCLE_SECONDS="$HALF_OPEN_INTERVAL"
+        logi "endpoint=$ENDPOINT_NAME event=half_open_trial seconds=$CYCLE_SECONDS"
+      else
+        CYCLE_SECONDS="$ROTATION_INTERVAL_SECONDS"
+      fi
+      return 0
+    fi
+
+    logd "endpoint=$ENDPOINT_NAME event=skipped state=EJECTED until=$(stats_field "$ENDPOINT_NAME" 8)"
+    _se_skipped="$_se_skipped $ENDPOINT_NAME"
+  done
+
+  # List exhausted. If we skipped anything, everything left is ejected.
+  if [ -n "$_se_skipped" ]; then
+    # shellcheck disable=SC2086
+    _se_best=$(stats_least_bad $_se_skipped)
+    if [ -n "$_se_best" ]; then
+      ALL_DEGRADED=1
+      CURRENT_OVPN_FILE="$OVPN_CONFIG_DIR/$_se_best"
+      ENDPOINT_NAME="$_se_best"
+      CYCLE_SECONDS="$HALF_OPEN_INTERVAL"
+      stats_set_state "$_se_best" HALF_OPEN 0
+      logw "event=all_endpoints_degraded action=forcing_least_bad endpoint=$_se_best ewma_ms=$(stats_field "$_se_best" 2)"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# --- ENDPOINT STATS STORE ---
+stats_init
+set_state starting ""
+probe_clock_ok || logw "event=no_nanosecond_clock impact=in_path_ttfb_probe_disabled fix=install_coreutils"
 
 # --- HEALTH / READY HTTP (separate from Privoxy proxy port) ---
 if [ "${HEALTH_HTTP_ENABLED:-1}" != "0" ]; then
@@ -178,50 +493,58 @@ if [ "${HEALTH_HTTP_ENABLED:-1}" != "0" ]; then
 fi
 
 # --- INITIAL LOAD OF OVPN FILES ---
-echo "DEBUG (main): Before initial call to load_and_shuffle_ovpn_files."
+logd "main: before initial call to load_and_shuffle_ovpn_files"
 if ! load_and_shuffle_ovpn_files; then
   echo "FATAL: Could not load any OVPN files on initial startup."
   exit 1
 fi
-echo "DEBUG (main): After initial call. OVPN_FILE_LIST contains:\n$OVPN_FILE_LIST"
+logd "main: initial load complete"
 
 # --- MAIN ROTATION LOOP ---
 while true; do
-  echo "DEBUG (main loop): Top of while."
+  [ "$_shutdown" = "1" ] && break
+  logd "main loop: top of while"
 
-  if ! get_next_ovpn_file; then # If OVPN_FILE_LIST is empty
-    echo "DEBUG (main loop): OVPN_FILE_LIST is empty. Entering reshuffle block."
-    echo "Reached end of OVPN file list or no files loaded. Reshuffling..."
+  # select_endpoint pops candidates and skips ejected ones. It returns
+  # non-zero only when the shuffled list is exhausted.
+  if ! select_endpoint; then
+    logd "main loop: candidate list exhausted, reshuffling"
     if ! load_and_shuffle_ovpn_files; then
-      echo "ERROR: Failed to reload OVPN files. Waiting 60s and retrying..."
-      sleep 60
-      continue # Go to top of while loop to try get_next_ovpn_file again
+      loge "event=reload_failed action=retry_in_60s"
+      interruptible_sleep 60
+      continue
     fi
-    # After successful reload, try to get the next file again
-    if ! get_next_ovpn_file; then
-        echo "FATAL: No OVPN files available even after attempting reload. Exiting."
-        exit 1
+    if ! select_endpoint; then
+      echo "FATAL: No OVPN files available even after attempting reload. Exiting."
+      exit 1
     fi
   fi
 
-  # CURRENT_OVPN_FILE is now set by get_next_ovpn_file
   PVPN_OVPN_FILE_PATH="$CURRENT_OVPN_FILE"
-  echo "DEBUG (main loop): Processing file: [$PVPN_OVPN_FILE_PATH]"
+  logd "main loop: processing file [$PVPN_OVPN_FILE_PATH]"
 
-  # ... (Rest of OpenVPN start, Privoxy start, sleep, cleanup logic remains the same) ...
-  # ... (Make sure to use PVPN_OVPN_FILE_PATH which is now $CURRENT_OVPN_FILE) ...
   echo ""
   echo "----------------------------------------------------"
-  echo "$(date): Starting new cycle. Using OVPN config: $(basename "$PVPN_OVPN_FILE_PATH")"
+  logi "event=cycle_start endpoint=$ENDPOINT_NAME state=$(stats_field "$ENDPOINT_NAME" 7) seconds=$CYCLE_SECONDS all_degraded=$ALL_DEGRADED"
   echo "Full config path: $PVPN_OVPN_FILE_PATH"
   echo "----------------------------------------------------"
 
+  # Remove rather than touch: detect_vpn_interface greps this log, and the
+  # window between --daemon forking and OpenVPN truncating the file let the
+  # PREVIOUS cycle's "TUN/TAP device" line be read as if it were this one.
+  rm -f "$OPENVPN_LOG"
   touch "$OPENVPN_LOG"; chmod 600 "$OPENVPN_LOG"
   echo "Launching OpenVPN client in background..."
+  # --ping/--ping-restart: the ProtonVPN .ovpn files ship no keepalive, so a
+  # silently dead UDP tunnel was invisible to OpenVPN itself (persist-tun keeps
+  # the interface and its IP up). Without these, a black-holed tunnel survived
+  # until the rotation interval elapsed.
   openvpn \
     --config "$PVPN_OVPN_FILE_PATH" \
     --auth-user-pass "$AUTH_FILE_PATH" \
     --auth-nocache \
+    --ping "${VPN_PING_INTERVAL:-10}" \
+    --ping-restart "${VPN_PING_RESTART:-60}" \
     --pull-filter ignore "route-ipv6" \
     --pull-filter ignore "ifconfig-ipv6" \
     --redirect-gateway def1 bypass-dhcp \
@@ -268,11 +591,29 @@ while true; do
       echo "OpenVPN process is NOT running!"
     fi
     echo "Skipping Privoxy start for this failed VPN. Trying next VPN server after a short delay..."
-    sleep 5
+    # A connect failure is a failure sample for this endpoint: repeated
+    # failures push err above ERR_TRIP_RATE and eject it from the rotation.
+    stats_record "$ENDPOINT_NAME" 0 1
+    logw "endpoint=$ENDPOINT_NAME event=connect_failed err=$(stats_field "$ENDPOINT_NAME" 5)"
+    _cf_fleet=$(stats_fleet_baseline)
+    case "$(stats_evaluate "$ENDPOINT_NAME" "$_cf_fleet")" in
+      TRIP_ERR|TRIP_SLOW)
+        if stats_ejection_frozen; then
+          logw "endpoint=$ENDPOINT_NAME event=trip_suppressed cause=ejection_circuit_breaker_open"
+        else
+          logw "endpoint=$ENDPOINT_NAME event=trip reason=connect_failures"
+          stats_trip "$ENDPOINT_NAME" "$(stats_now)"
+        fi
+        ;;
+    esac
+    set_state notready "$ENDPOINT_NAME"
+    interruptible_sleep 5
   else
-    if ! pgrep -x openvpn > /dev/null; then
+    if ! openvpn_running; then
         echo "Error: OpenVPN process is not running after successful interface check (unexpected). Skipping Privoxy."
-        sleep 5
+        stats_record "$ENDPOINT_NAME" 0 1
+        set_state notready "$ENDPOINT_NAME"
+        interruptible_sleep 5
     else
       echo "OpenVPN process is running and interface is up."
       echo "Current /etc/resolv.conf (expected to be set by update-resolv-conf via VPN):"
@@ -304,37 +645,77 @@ while true; do
       chown privoxy:privoxy "$PRIVPROXY_LOGDIR" 2>/dev/null || chown root:root "$PRIVPROXY_LOGDIR"
       privoxy --no-daemon "$PRIVOXY_CONFIG" &
       privoxy_pid=$!
-      echo "Privoxy started with PID: $privoxy_pid"
-      echo "Attempting to get current external IP..."
-      current_ip=$(wget -T 10 -qO- http://ipv4.icanhazip.com || wget -T 10 -qO- http://ifconfig.me/ip || echo "N/A")
-      echo "Current external IP via VPN: $current_ip (Server: $(basename "$PVPN_OVPN_FILE_PATH"))"
-      echo "Sleeping for $ROTATION_INTERVAL_SECONDS seconds..."
-      sleep "$ROTATION_INTERVAL_SECONDS"
-      echo "Rotation interval elapsed. Stopping Privoxy..."
-      if [ -n "$privoxy_pid" ] && kill -0 "$privoxy_pid" 2>/dev/null; then
-        kill "$privoxy_pid"
-        wait "$privoxy_pid" 2>/dev/null || true
+      logi "event=privoxy_started pid=$privoxy_pid endpoint=$ENDPOINT_NAME"
+
+      # Confirm Privoxy is actually listening before declaring readiness;
+      # `&` only proves fork() succeeded, not that bind() did.
+      _pw=0
+      while [ "$_pw" -lt 10 ]; do
+        ss -Hltn "sport = :${PROXY_PORT}" 2>/dev/null | grep -q . && break
+        kill -0 "$privoxy_pid" 2>/dev/null || break
+        sleep 1; _pw=$((_pw + 1))
+      done
+      if ! kill -0 "$privoxy_pid" 2>/dev/null; then
+        loge "endpoint=$ENDPOINT_NAME event=privoxy_died_at_startup"
+        stats_record "$ENDPOINT_NAME" 0 1
+        privoxy_pid=""
+        set_state notready "$ENDPOINT_NAME"
       else
-        echo "Privoxy was not running or PID $privoxy_pid unknown/invalid."
+        set_state ready "$ENDPOINT_NAME"
+        echo "Attempting to get current external IP..."
+        current_ip=$(wget -T 10 -qO- http://ipv4.icanhazip.com || wget -T 10 -qO- http://ifconfig.me/ip || echo "N/A")
+        logi "event=exit_ip endpoint=$ENDPOINT_NAME ip=$current_ip"
+
+        # Supervised cycle. Replaces the blocking `sleep $ROTATION_INTERVAL`,
+        # which (a) made the container unresponsive to SIGTERM, (b) let a dead
+        # tunnel keep serving for up to the full interval, and (c) collected
+        # no evidence about how this endpoint was performing.
+        if run_cycle "$ENDPOINT_NAME" "$CYCLE_SECONDS"; then
+          stats_mark_clean_cycle "$ENDPOINT_NAME"
+          ROTATION_REASON="scheduled"
+        fi
+        logi "event=cycle_end endpoint=$ENDPOINT_NAME reason=$ROTATION_REASON"
+
+        # Half-open trial that neither tripped nor demonstrably recovered stays
+        # half-open; it gets another short trial rather than full traffic.
+        if [ "$(stats_field "$ENDPOINT_NAME" 7)" = "HALF_OPEN" ] && [ "$ROTATION_REASON" = "scheduled" ]; then
+          _ho_fleet=$(stats_fleet_baseline)
+          if [ "$(stats_evaluate "$ENDPOINT_NAME" "$_ho_fleet")" = "RECOVER" ]; then
+            logi "endpoint=$ENDPOINT_NAME event=half_open_recovered"
+            stats_set_state "$ENDPOINT_NAME" OK 0
+          else
+            logi "endpoint=$ENDPOINT_NAME event=half_open_inconclusive action=remain_half_open"
+          fi
+        fi
       fi
-      privoxy_pid=""
+
+      set_state draining "$ENDPOINT_NAME"
+      drain_privoxy
     fi
   fi
 
-  if pgrep -x openvpn > /dev/null; then
-    echo "Stopping OpenVPN process for this cycle..."
+  # Tunnel teardown happens only AFTER the proxy has drained, so no request is
+  # cut off by the routes disappearing underneath it.
+  set_state notready "$ENDPOINT_NAME"
+  if openvpn_running; then
+    logi "event=openvpn_stop endpoint=$ENDPOINT_NAME"
     pkill -TERM openvpn
     _wait_count=0
-    while pgrep -x openvpn > /dev/null && [ $_wait_count -lt 5 ]; do
+    while openvpn_running && [ $_wait_count -lt 10 ]; do
       sleep 0.5
       _wait_count=$((_wait_count + 1))
     done
-    if pgrep -x openvpn > /dev/null; then
-      echo "OpenVPN did not stop gracefully after SIGTERM, forcing SIGKILL..."
+    if openvpn_running; then
+      logw "event=openvpn_sigkill endpoint=$ENDPOINT_NAME reason=sigterm_timeout"
       pkill -KILL openvpn
     fi
-    echo "OpenVPN stopped for this cycle."
   fi
+  # Reap the daemonised OpenVPN that PID 1 inherited, so `pgrep -x openvpn`
+  # on the next cycle cannot match a zombie. See also `init: true` in
+  # docker-compose.yml, which handles this properly.
+  wait 2>/dev/null || true
   # No 'shift' needed as we are managing OVPN_FILE_LIST and CURRENT_OVPN_FILE
 done
+
+logi "event=supervisor_exit reason=shutdown"
 

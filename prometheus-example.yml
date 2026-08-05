@@ -1,0 +1,135 @@
+# Example Prometheus scrape config + alert rules for proton-privoxy.
+# Copy the pieces you need into your own Prometheus setup; this file is
+# documentation, nothing in this repo reads it.
+#
+# ---------------------------------------------------------------------------
+# NETWORKING: how Prometheus reaches the health port
+# ---------------------------------------------------------------------------
+# docker-compose.yml publishes 8081 on 127.0.0.1 of the HOST, which a
+# Prometheus running in its own container cannot reach. Pick one:
+#
+#   A) Shared docker network (cleanest). Attach both containers to the same
+#      network and scrape the container name directly — no host publishing
+#      involved, so it keeps working even if you remove the ports: block.
+#        targets: ['proton_privoxy_service:8081']
+#
+#   B) Prometheus on the host network:
+#        targets: ['127.0.0.1:8081']
+#
+#   C) Prometheus containerised on a different network, reaching the host:
+#        targets: ['172.17.0.1:8081']     # docker0 gateway
+#      and change the publish to that interface. Least tidy; prefer (A).
+
+scrape_configs:
+  - job_name: proton-privoxy
+    # 15s is plenty: the supervisor only re-renders every SAMPLE_INTERVAL
+    # (60s), so faster scraping mostly re-reads the same numbers. The
+    # exceptions are proxy_state_age_seconds / proxy_ready / proxy_up, which
+    # are computed live at scrape time.
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['proton_privoxy_service:8081']
+
+---
+# ---------------------------------------------------------------------------
+# ALERT RULES
+# ---------------------------------------------------------------------------
+groups:
+  - name: proton-privoxy
+    rules:
+
+      # The two that matter most.
+
+      - alert: ProxyNotReady
+        expr: proxy_ready == 0
+        for: 3m
+        labels: { severity: critical }
+        annotations:
+          summary: "proton-privoxy not ready for 3m"
+          description: >
+            Rotation takes ~10-45s, so a brief 0 is normal. Three minutes
+            means it is not coming back on its own. Check
+            `curl :8081/ready` — the `reason` field says which of state /
+            privoxy_down / stale_state it is.
+
+      - alert: ProxySupervisorWedged
+        expr: proxy_state_age_seconds > 120
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Supervisor loop has not heartbeat in {{ $value }}s"
+          description: >
+            The rotation loop is stuck. This is the failure mode where every
+            other signal still looks healthy — privoxy up, tunnel up, last
+            known state "ready" — so nothing else will catch it.
+
+      # Tunnel health.
+
+      - alert: ProxyTunnelDown
+        expr: proxy_tunnel_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Egress is not going through the VPN tunnel"
+          description: >
+            Traffic may be leaving via the host's real IP. Verify with
+            `docker exec proton_privoxy_service ip route get 1.1.1.1`.
+
+      - alert: ProxyTunnelFlapping
+        expr: increase(proxy_rotations_total{reason="vpn_down"}[1h]) > 3
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} unplanned tunnel drops in the last hour"
+          description: >
+            Scheduled rotations are reason="scheduled". Repeated "vpn_down"
+            means tunnels are dying — a bad exit, ProtonVPN trouble, or an
+            uplink problem on this host.
+
+      # Endpoint scoring health. These fire on the SCORER misbehaving, which
+      # is at least as likely as the endpoints misbehaving.
+
+      - alert: ProxyAllEndpointsDegraded
+        expr: proxy_all_degraded == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Every exit is ejected; forcing traffic through the least-bad one"
+          description: >
+            Traffic still flows (by design — the scorer never black-holes),
+            but every endpoint has tripped. Far more often a local problem
+            than a whole-fleet failure.
+
+      - alert: ProxyEjectionStorm
+        expr: proxy_ejection_frozen == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Ejection circuit breaker is open"
+          description: >
+            More than MAX_EJECT_FRACTION of the fleet is ejected, so new
+            ejections are frozen. Suspect this host (uplink, DNS, ProtonVPN
+            account) before suspecting the exits.
+
+      - alert: ProxyEndpointErrorRate
+        expr: proxy_endpoint_error_ratio > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.endpoint }} error ratio {{ $value }}"
+          description: >
+            At/above ERR_TRIP_RATE. If this fires across MANY endpoints at
+            once, do not believe it — that pattern means the measurement is
+            broken, not the fleet. Check that the probe still works:
+            `docker exec proton_privoxy_service /app/probe_ttfb.sh ttfb
+            http://ipv4.icanhazip.com/` should print "<ms> 0".
+
+      # Worth a dashboard panel rather than an alert:
+      #   proxy_endpoint_ttfb_ewma_ms      per-exit latency, the scoring signal
+      #   proxy_endpoint_ttfb_baseline_ms  its frozen "normal" — divergence
+      #                                    from the ewma above IS a degradation
+      #   proxy_fleet_baseline_ms          fleet median the ratios compare to
+      #   proxy_passive_rtt_ms             transport RTT; if this stays flat
+      #                                    while ewma climbs, blame the origin
+      #                                    rather than the exit
+      #   proxy_client_connections         whether anything is using the proxy
+      #   proxy_exit_ip_info               correlate a bad window to an exit IP

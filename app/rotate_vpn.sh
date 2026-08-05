@@ -32,6 +32,13 @@ VPN_WATCHDOG_INTERVAL=${VPN_WATCHDOG_INTERVAL:-5}
 # probe was only a fallback for thin traffic, and became a knob that did
 # nothing once the probe became the primary measurement.)
 SAMPLE_INTERVAL=${SAMPLE_INTERVAL:-60}
+# Seconds after an exit takes over before its latency is scored. The first
+# probe of a cycle fires seconds after the tunnel comes up, with DNS still
+# resolving and the tunnel cold — a wildly unrepresentative sample. Because the
+# baseline is a plain mean during warm-up, one such reading dragged an observed
+# endpoint's baseline to 358ms against a true 148ms, which then desensitised it
+# for hours. The kill switch is unaffected; it runs every tick regardless.
+SAMPLE_WARMUP=${SAMPLE_WARMUP:-60}
 PASSIVE_RTT_ENABLED=${PASSIVE_RTT_ENABLED:-1}
 PASSIVE_MIN_SOCKETS=${PASSIVE_MIN_SOCKETS:-2}
 HALF_OPEN_INTERVAL=${HALF_OPEN_INTERVAL:-60}
@@ -411,7 +418,8 @@ run_cycle() {
       CLIENT_CONNS=$(proxy_conn_count)
     fi
 
-    if [ "$ENDPOINT_SCORING_ENABLED" = "1" ] && [ "$_rc_sample_due" -eq 1 ]; then
+    if [ "$ENDPOINT_SCORING_ENABLED" = "1" ] && [ "$_rc_sample_due" -eq 1 ] \
+       && [ "$_rc_elapsed" -ge "$SAMPLE_WARMUP" ]; then
       # Computed BEFORE recording: stats_record uses it to freeze the baseline
       # while a sample is already anomalous, so a sustained degradation cannot
       # teach the detector to treat itself as normal.

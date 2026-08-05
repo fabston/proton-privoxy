@@ -666,10 +666,9 @@ while true; do
           rm -f "$_tmp_resolv"
       fi
 
-      echo "Starting Privoxy..."
-      PRIVPROXY_LOGDIR="/var/log/privoxy"
-      mkdir -p "$PRIVPROXY_LOGDIR"
-      chown privoxy:privoxy "$PRIVPROXY_LOGDIR" 2>/dev/null || chown root:root "$PRIVPROXY_LOGDIR"
+      # No logdir setup: app/config leaves `logfile` unset so Privoxy writes to
+      # stderr, which lands in `docker logs` alongside the supervisor's events
+      # and is rotated by the json-file driver.
       privoxy --no-daemon "$PRIVOXY_CONFIG" &
       privoxy_pid=$!
       logi "event=privoxy_started pid=$privoxy_pid endpoint=$ENDPOINT_NAME"

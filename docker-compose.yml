@@ -42,6 +42,12 @@ services:
     env_file:
       - .env                  # Load environment variables from .env file
     restart: unless-stopped
+    # MUST exceed DRAIN_GRACE + OpenVPN teardown, or Docker SIGKILLs the
+    # container mid-drain and the graceful shutdown never completes.
+    # Budget: DRAIN_GRACE (30) + openvpn SIGTERM wait (5) + margin.
+    # Docker's default here is 10s, which is LESS than DRAIN_GRACE alone —
+    # raising the drain without raising this just guarantees a hard kill.
+    stop_grace_period: 45s
     volumes:
       # Endpoint latency history and degradation state. Without this the
       # scorer relearns every endpoint from zero on each restart, and an exit

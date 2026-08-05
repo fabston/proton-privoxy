@@ -6,18 +6,23 @@
 # Standard files like default.action, default.filter are expected here.
 confdir /etc/privoxy
 
-# logdir: Directory where Privoxy will write its logfile.
-# app/run creates this directory.
-logdir /var/log/privoxy
-
-# logfile: Name of the logfile within logdir.
+# logdir / logfile: BOTH deliberately unset.
 #
-# WARNING: this writes to the container's writable layer with no rotation. At
-# `debug 4096` the volume is negligible, but raising `debug` (see below) will
-# fill the disk with nothing to truncate it. To send Privoxy's log to the
-# container's stdout instead — where Docker's log driver can rotate it —
-# comment out both `logdir` and `logfile` and Privoxy logs to stderr.
-logfile logfile
+# With no `logfile`, Privoxy writes to stderr, which in this container is the
+# supervisor's stderr and therefore `docker logs`. That gets you:
+#   - one place to look, interleaved with the supervisor's own event= lines
+#   - rotation for free, via the json-file max-size/max-file already set in
+#     docker-compose.yml
+#   - nothing accumulating in the container's writable layer
+#
+# The previous `logdir /var/log/privoxy` + `logfile logfile` wrote to an
+# unrotated file inside the container that was lost on every restart and
+# invisible to `docker logs`. That was survivable at `debug 4096`; at the
+# `debug 12288` set below it would grow with every upstream error.
+#
+# Re-enable only if you are shipping the file somewhere that rotates it:
+# logdir /var/log/privoxy
+# logfile logfile
 
 # listen-address: IP address and port Privoxy listens on.
 listen-address  0.0.0.0:8100

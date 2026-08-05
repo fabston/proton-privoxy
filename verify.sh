@@ -35,6 +35,20 @@ esac
 _up=$(docker inspect --format '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null)
 [ -n "$_up" ] && echo "        started $_up"
 
+# Privoxy only starts AFTER the tunnel is up, so everything below fails
+# spuriously if we look during startup. Wait it out rather than cry wolf.
+_w=0
+while [ "$_w" -lt "${WAIT_READY:-90}" ]; do
+  case "$(curl -s -m 5 "http://$HEALTH/ready" 2>/dev/null)" in *'"ready"'*) break ;; esac
+  [ "$_w" -eq 0 ] && printf '        waiting for readiness (first VPN connect takes ~5-45s)'
+  printf '.'
+  sleep 3; _w=$((_w + 3))
+done
+[ "$_w" -gt 0 ] && echo
+if [ "$_w" -ge "${WAIT_READY:-90}" ]; then
+  warn "still not ready after ${WAIT_READY:-90}s — checks below may reflect a mid-rotation state"
+fi
+
 head_ "2. Processes"
 if dex pgrep -x privoxy >/dev/null; then pass "privoxy running"; else fail "privoxy NOT running"; fi
 if dex pgrep -x openvpn >/dev/null; then pass "openvpn running"; else fail "openvpn NOT running"; fi

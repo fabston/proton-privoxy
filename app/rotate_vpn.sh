@@ -53,9 +53,12 @@ logd()  { [ "$DEBUG_LOG" = "1" ] && echo "$(ts) DEBUG $*"; return 0; }
 
 # Readiness is published as a file so the health handler does not have to
 # re-derive it (and cannot disagree with the supervisor about the interface).
+# Fields are space-separated and read with awk, which collapses runs of
+# whitespace. An empty endpoint field therefore made $2 pick up the timestamp,
+# so /ready reported `"endpoint":"1785921915"`. Write "-" for "no endpoint".
 set_state() {
   mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
-  printf '%s %s %s\n' "$1" "${2:-}" "$(date +%s)" > "${STATE_FILE}.tmp.$$" \
+  printf '%s %s %s\n' "$1" "${2:--}" "$(date +%s)" > "${STATE_FILE}.tmp.$$" \
     && mv -f "${STATE_FILE}.tmp.$$" "$STATE_FILE"
 }
 

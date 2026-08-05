@@ -9,7 +9,11 @@ AUTH_FILE_PATH="/etc/openvpn/auth.txt"
 OVPN_CONFIG_DIR="/etc/openvpn/configs"
 PRIVOXY_CONFIG="/app/config"
 OPENVPN_LOG="/tmp/openvpn_connect.log"
-ROTATION_INTERVAL_SECONDS=${ROTATION_INTERVAL:-300}
+# 86400 (daily). Rotation costs a hard cut of every in-flight connection, so
+# unless a fresh exit IP is worth that on its own, do not pay it often. The
+# tunnel is watched continuously by VPN_WATCHDOG_INTERVAL regardless, and a
+# degraded exit is rotated away by the scorer rather than by this timer.
+ROTATION_INTERVAL_SECONDS=${ROTATION_INTERVAL:-86400}
 VPN_CONNECT_TIMEOUT=${VPN_CONNECT_TIMEOUT:-45}
 OVPN_FILE_PATTERN=${OVPN_FILE_PATTERN:-*.ovpn}
 
@@ -28,7 +32,9 @@ PROBE_INTERVAL=${PROBE_INTERVAL:-60}
 PASSIVE_RTT_ENABLED=${PASSIVE_RTT_ENABLED:-1}
 PASSIVE_MIN_SOCKETS=${PASSIVE_MIN_SOCKETS:-2}
 HALF_OPEN_INTERVAL=${HALF_OPEN_INTERVAL:-60}
-DRAIN_GRACE=${DRAIN_GRACE:-10}
+# 30s. Sized against the 86400 default: a drain this long costs 0.03% of
+# uptime, so buy the headroom. Drop to ~10 only if you also shorten the cycle.
+DRAIN_GRACE=${DRAIN_GRACE:-30}
 PROXY_PORT=${PROXY_PORT:-8100}
 PROBE_TARGETS=${PROBE_TARGETS:-"http://ipv4.icanhazip.com/ http://ifconfig.me/ip"}
 STATE_FILE=${STATE_FILE:-/var/lib/proxy/state}

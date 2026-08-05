@@ -7,15 +7,14 @@ LABEL maintainer="Proton-Privoxy User"
 
 EXPOSE 8100 8081
 
-# Default environment variables.
+# Credentials only. Operational defaults deliberately do NOT live here:
+# an ENV entry always shadows a `${VAR:-default}` in the scripts, so having
+# both meant the shell defaults were dead code and the real value was
+# whichever layer you happened to read. The scripts are now the single source
+# of truth — see app/rotate_vpn.sh and app/endpoint_stats.sh.
+# (HOST_NETWORK was also removed here: nothing has ever read it.)
 ENV PVPN_USERNAME="" \
-    PVPN_PASSWORD="" \
-    HOST_NETWORK= \
-    DNS_SERVERS_OVERRIDE= \
-    ROTATION_INTERVAL="300" \
-    HEALTH_PORT="8081" \
-    HEALTH_LISTEN_ADDR="0.0.0.0" \
-    HEALTH_HTTP_ENABLED="1"
+    PVPN_PASSWORD=""
 
 # Supply-chain pins for the third-party DNS script fetched below.
 # Set both to a reviewed commit before deploying; master is not a version.

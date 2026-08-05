@@ -31,7 +31,12 @@ STATS_FILE="${STATS_FILE:-$STATS_DIR/endpoint_stats}"
 METRICS_FILE="${METRICS_FILE:-$STATS_DIR/metrics.prom}"
 
 EWMA_ALPHA="${EWMA_ALPHA:-0.2}"
-BASELINE_ALPHA="${BASELINE_ALPHA:-0.02}"
+# 0.005 (~400 samples = ~6.6h at SAMPLE_INTERVAL=60). Paired with the 86400
+# ROTATION_INTERVAL default: a baseline shorter than the diurnal cycle makes a
+# genuine evening traffic peak read as degradation, which is the most likely
+# source of false ejections. Raise toward 0.02 only if you also shorten the
+# rotation interval — these two must move together.
+BASELINE_ALPHA="${BASELINE_ALPHA:-0.005}"
 # ERR_ALPHA vs ERR_TRIP_RATE are coupled: with alpha=0.3 a SINGLE failure puts
 # the EWMA at 0.30, which already exceeded a 0.25 threshold — one transient
 # error ejected an endpoint for 15 minutes. At alpha=0.10 it takes three

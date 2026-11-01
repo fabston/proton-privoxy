@@ -29,6 +29,11 @@ scrape_configs:
     scrape_interval: 15s
     static_configs:
       - targets: ['proton_privoxy_service:8081']
+        # If you run docker-compose.ivpn.yml too, use this instead so the rules
+        # below cover it (the `instance` label tells the stacks apart). That
+        # stack is a separate Compose project with its own network, so attach
+        # Prometheus to privoxy-ivpn_default as well:
+        # targets: ['proton_privoxy_service:8081', 'ivpn_privoxy_service:8081']
 
 ---
 # ---------------------------------------------------------------------------
@@ -45,11 +50,11 @@ groups:
         for: 3m
         labels: { severity: critical }
         annotations:
-          summary: "proton-privoxy not ready for 3m"
+          summary: "{{ $labels.instance }} not ready for 3m"
           description: >
             Rotation takes ~10-45s, so a brief 0 is normal. Three minutes
             means it is not coming back on its own. Check
-            `curl :8081/ready` — the `reason` field says which of state /
+            /ready on that instance — the `reason` field says which of state /
             privoxy_down / stale_state it is.
 
       - alert: ProxySupervisorWedged
@@ -73,7 +78,7 @@ groups:
           summary: "Egress is not going through the VPN tunnel"
           description: >
             Traffic may be leaving via the host's real IP. Verify with
-            `docker exec proton_privoxy_service ip route get 1.1.1.1`.
+            `docker exec <container> ip route get 1.1.1.1` for {{ $labels.instance }}.
 
       - alert: ProxyTunnelFlapping
         expr: increase(proxy_rotations_total{reason="vpn_down"}[1h]) > 3
@@ -82,7 +87,7 @@ groups:
           summary: "{{ $value }} unplanned tunnel drops in the last hour"
           description: >
             Scheduled rotations are reason="scheduled". Repeated "vpn_down"
-            means tunnels are dying — a bad exit, ProtonVPN trouble, or an
+            means tunnels are dying — a bad exit, VPN provider trouble, or an
             uplink problem on this host.
 
       # Endpoint scoring health. These fire on the SCORER misbehaving, which
@@ -107,7 +112,7 @@ groups:
           summary: "Ejection circuit breaker is open"
           description: >
             More than MAX_EJECT_FRACTION of the fleet is ejected, so new
-            ejections are frozen. Suspect this host (uplink, DNS, ProtonVPN
+            ejections are frozen. Suspect this host (uplink, DNS, VPN
             account) before suspecting the exits.
 
       - alert: ProxyEndpointErrorRate
@@ -120,7 +125,7 @@ groups:
             At/above ERR_TRIP_RATE. If this fires across MANY endpoints at
             once, do not believe it — that pattern means the measurement is
             broken, not the fleet. Check that the probe still works:
-            `docker exec proton_privoxy_service /app/probe_ttfb.sh ttfb
+            `docker exec <container> /app/probe_ttfb.sh ttfb
             http://ipv4.icanhazip.com/` should print "<ms> 0".
 
       # Worth a dashboard panel rather than an alert:

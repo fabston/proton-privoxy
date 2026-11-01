@@ -1,0 +1,55 @@
+# IVPN stack — a second, fully separate proxy that runs alongside the ProtonVPN
+# one, with its own credentials, exits, ports and endpoint history.
+#
+#   tools/gen_ivpn_configs.py --country CH,SE,DE
+#   cp .env.ivpn.example.txt .env.ivpn     # then set your account ID
+#   docker compose -f docker-compose.ivpn.yml up -d --build
+#
+# STANDALONE, not an overlay: Compose CONCATENATES `ports:` across -f files, so
+# an overlay would also inherit the Proton stack's 8100/8081 bindings. `name:`
+# keeps it a separate project, so neither stack treats the other as an orphan
+# and the state volume stays separate. Sharing that volume would leave one
+# provider's latency history in the other's fleet median.
+
+name: privoxy-ivpn
+
+services:
+  ivpn-privoxy:
+    build:
+      context: .
+      args:
+        OVPN_CONFIG_DIR: ovpn_configs_ivpn   # IP-based, from tools/gen_ivpn_configs.py
+    container_name: ivpn_privoxy_service
+    # Loopback by default. Read the EXPOSURE block in docker-compose.yml before
+    # changing this; 0.0.0.0 on a VPS is an open proxy on your IVPN account.
+    ports:
+      - "127.0.0.1:8101:8100"   # Privoxy HTTP proxy
+      - "127.0.0.1:8082:8081"   # GET /health, /ready, /metrics
+    cap_add:
+      - NET_ADMIN               # Required for OpenVPN to change interfaces and routes
+    init: true                  # Reaps the daemonised OpenVPN; see docker-compose.yml
+    env_file:
+      - .env.ivpn
+    restart: unless-stopped
+    stop_grace_period: 45s      # Must exceed DRAIN_GRACE + OpenVPN teardown
+    volumes:
+      - proxy_state:/var/lib/proxy
+    healthcheck:
+      # `$$` defers to the container's environment. Compose would otherwise fill
+      # this from the Proton stack's .env, the file it auto-loads, instead of
+      # from .env.ivpn, which is what the listener actually reads.
+      test: ["CMD", "sh", "-c", "wget -q -T 3 -O /dev/null http://127.0.0.1:$${HEALTH_PORT:-8081}/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    pids_limit: 512
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  proxy_state:

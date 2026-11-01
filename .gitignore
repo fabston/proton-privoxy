@@ -1,3 +1,6 @@
 .env
 ovpn_configs/*
 my_host_auth.txt
+.env.ivpn
+ovpn_configs_ivpn/*
+!ovpn_configs_ivpn/.gitkeep

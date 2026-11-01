@@ -59,8 +59,10 @@ RUN apk --no-cache add \
 # Copy application scripts and Privoxy main configuration
 COPY app /app
 
-# Copy downloaded OpenVPN configuration files from host to image
-COPY ovpn_configs /etc/openvpn/configs
+# Copy OpenVPN configuration files from host to image. The directory is a build
+# arg because each provider's stack bakes in its own exits (docker-compose.ivpn.yml).
+ARG OVPN_CONFIG_DIR=ovpn_configs
+COPY ${OVPN_CONFIG_DIR} /etc/openvpn/configs
 
 # Copy minimal/empty Privoxy standard config files
 COPY empty.filter /etc/privoxy/default.filter

@@ -2,7 +2,7 @@
 set -e # Exit immediately if a command exits with a non-zero status.
 # set -x # Uncomment for verbose debugging of this script
 
-echo "--- ProtonVPN Direct OpenVPN Entrypoint ---"
+echo "--- Direct OpenVPN Entrypoint ---"
 
 # --- ENSURE /dev/net/tun EXISTS ---
 if [ ! -c /dev/net/tun ]; then
@@ -19,11 +19,11 @@ fi
 
 # --- VALIDATE REQUIRED ENVIRONMENT VARIABLES ---
 if [ -z "$PVPN_USERNAME" ]; then
-  echo "Error: PVPN_USERNAME environment variable is not set. Check your .env file."
+  echo "Error: PVPN_USERNAME environment variable is not set. Check your env file (.env, or .env.ivpn for IVPN)."
   exit 1
 fi
 if [ -z "$PVPN_PASSWORD" ]; then
-  echo "Error: PVPN_PASSWORD environment variable is not set. Check your .env file."
+  echo "Error: PVPN_PASSWORD environment variable is not set. Check your env file (.env, or .env.ivpn for IVPN)."
   exit 1
 fi
 # PVPN_OVPN_FILE is no longer directly used by this script for OpenVPN start,

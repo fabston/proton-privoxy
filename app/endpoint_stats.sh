@@ -6,9 +6,11 @@
 # Sourced by rotate_vpn.sh. POSIX sh only; all floating-point math goes
 # through awk because sh has integer arithmetic only.
 #
-# An "endpoint" here is one .ovpn file = one ProtonVPN exit server. Only one
+# An "endpoint" here is one .ovpn file = one VPN exit server. Only one
 # is active at a time (see rotate_vpn.sh main loop), so every sample taken
 # during a cycle is attributed to the endpoint that cycle is running.
+# A file listing several servers breaks that attribution, which is one reason
+# IVPN's stock files are split by tools/gen_ivpn_configs.py.
 #
 # Record schema, one space-separated line per endpoint in $STATS_FILE:
 #   1  name        basename of the .ovpn file
@@ -68,6 +70,23 @@ _ejection_frozen=0
 stats_init() {
   mkdir -p "$STATS_DIR" 2>/dev/null || true
   [ -f "$STATS_FILE" ] || : > "$STATS_FILE"
+  stats_prune_missing
+}
+
+# stats_prune_missing
+#
+# Drops records of endpoints the image no longer ships. The state volume outlives
+# a rebuild, and a removed exit is never sampled again, so its frozen EWMA would
+# stay in the fleet median and its record in the MAX_EJECT_FRACTION denominator.
+# Keeps everything if no configs are found: that is a bad build, not a new fleet.
+stats_prune_missing() {
+  _pm_keep=$(find "$OVPN_CONFIG_DIR" -maxdepth 1 -type f -name "$OVPN_FILE_PATTERN" 2>/dev/null | sed 's#.*/##')
+  [ -n "$_pm_keep" ] || return 0
+  _pm_tmp="${STATS_FILE}.tmp.$$"
+  printf '%s\n' "$_pm_keep" \
+    | awk 'NR == FNR { keep[$1] = 1; next } $1 in keep' - "$STATS_FILE" > "$_pm_tmp" \
+    && _stats_write "$_pm_tmp" \
+    || rm -f "$_pm_tmp"
 }
 
 # stats_now — epoch seconds
